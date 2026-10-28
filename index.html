@@ -1,0 +1,2222 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Receipts verifier</title>
+<style>
+  :root { --bg:#fbfaf7; --fg:#1d1d1b; --muted:#6b6a65; --line:#dedbd2; --ok:#1f7a3f; --bad:#b3261e; --warn:#8a5a00; --card:#ffffff; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#151514; --fg:#ecebe6; --muted:#a3a29b; --line:#33322e; --ok:#5cc485; --bad:#f2827a; --warn:#e0b25a; --card:#1d1d1b; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 760px; margin: 0 auto; padding: 32px 16px 64px; }
+  h1 { font-size: 1.5rem; margin: 0 0 4px; }
+  p.lede { color: var(--muted); margin: 0 0 24px; }
+  label { display: block; margin: 16px 0 6px; }
+  textarea.short { min-height: 96px; font: inherit; }
+  p.hint { color: var(--muted); font-size: 0.875rem; margin: 4px 0 0; }
+  textarea { width:100%; min-height: 180px; padding: 12px; border:1px solid var(--line); border-radius: 8px; background: var(--card); color: var(--fg); font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  button { margin-top: 12px; padding: 10px 18px; border: 0; border-radius: 8px; background: var(--fg); color: var(--bg); font-weight: 600; cursor: pointer; }
+  ol#steps { list-style: none; padding: 0; margin: 24px 0 0; }
+  ol#steps li { padding: 12px 14px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); margin-bottom: 8px; }
+  .mark { font-weight: 700; margin-right: 6px; }
+  .ok .mark { color: var(--ok); } .bad .mark { color: var(--bad); } .warn .mark { color: var(--warn); }
+  .detail { display:block; color: var(--muted); font-size: 0.875rem; overflow-wrap: anywhere; margin-top: 2px; }
+  #summary { margin-top: 20px; font-weight: 600; }
+  input[type=file] { font: inherit; color: var(--fg); max-width: 100%; }
+  ol#steps li.section { border: 0; background: none; padding: 16px 0 4px; font-weight: 700; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Receipts verifier</h1>
+  <p class="lede">Checks a receipt without trusting Receipts: it re-hashes the claim record, folds its Merkle proof, and reads the anchor transaction from the chain itself. Give it the post's text or photos from any copy and it checks that the record is about those words and those photos. Give it an archived copy of the post's page and it checks who wrote it. Give it a settlement and it works out the outcome and the baseline again from the settlement's own data. Give it a caller's checkpoint and it says how recent it is: given every record up to it, none was held back. Give it a caller's whole export and it works their score out again from the records themselves. Nothing here calls our servers.</p>
+  <label for="bundle">Paste a receipt's, a settlement's or a checkpoint's verification bundle, or a caller's export (JSON)</label>
+  <textarea id="bundle" spellcheck="false"></textarea>
+  <label for="post-text">Optional: the post's text, copied from the live post, an archive or your own copy</label>
+  <textarea id="post-text" class="short"></textarea>
+  <p class="hint">Links, line breaks and leading @replies are ignored, so copy only the post's own words; the result shows exactly what was compared. Emoji count, so a copy that drops them, as some do where a page shows emoji as pictures, won't match.</p>
+  <label for="photos">Optional: the post's photos, saved from X or an archive</label>
+  <input id="photos" type="file" multiple>
+  <p class="hint">Only the exact files X serves match: a screenshot, crop or resized copy never will. The result says where to get each one. The files stay on your computer.</p>
+  <label for="archive-copies">Optional: a raw copy of the post's page from an archive</label>
+  <input id="archive-copies" type="file" multiple>
+  <p class="hint">The result gives the raw address of each copy the receipt lists: save that page, or the archive's copy of X's answer for the post, and give it here. It is read as text to find who wrote the post and what it said, never opened as a page, and stays on your computer.</p>
+  <label for="data-files">Optional, for a settlement: the data files it cites, or a left-out source's files, downloaded from Binance</label>
+  <input id="data-files" type="file" multiple>
+  <p class="hint">A file the settlement cites is checked against the SHA-256 it cites, which is the one Binance publishes beside the file. Where it left Binance out, any other file is read as Binance's data, to see whether Binance would have agreed; check each of those against Binance's checksum yourself. The result lists the files and their checksums.</p>
+  <button id="verify" type="button">Verify</button>
+  <ol id="steps"></ol>
+  <p id="summary"></p>
+</main>
+
+<script id="verifier-core">
+"use strict";
+// Everything in this script is pure and also runs under the server's test
+// suite, which checks it against the server's own implementation.
+
+/* ---------- config ---------- */
+// Public RPC per chain id. Edit to use your own node.
+const RPC_BY_CHAIN = { 1155: "https://rpc.intuition.systems/http" };
+// Published anchor attestor set: { chainId, address, from, until } with ISO
+// dates; until is null for a key still in use. A key counts only on the chain
+// it is listed for, so pointing the verifier at a node for another chain never
+// makes an anchor there count. Empty until the first key is published.
+const ANCHOR_ATTESTORS = [];
+
+/* ---------- keccak-256 (Ethereum padding), dependency-free; from Signal's verifier ---------- */
+const M = (1n << 64n) - 1n;
+const RC = [0x0000000000000001n,0x0000000000008082n,0x800000000000808an,0x8000000080008000n,
+0x000000000000808bn,0x0000000080000001n,0x8000000080008081n,0x8000000000008009n,
+0x000000000000008an,0x0000000000000088n,0x0000000080008009n,0x000000008000000an,
+0x000000008000808bn,0x800000000000008bn,0x8000000000008089n,0x8000000000008003n,
+0x8000000000008002n,0x8000000000000080n,0x000000000000800an,0x800000008000000an,
+0x8000000080008081n,0x8000000000008080n,0x0000000080000001n,0x8000000080008008n];
+const ROT = [0,1,62,28,27,36,44,6,55,20,3,10,43,25,39,41,45,15,21,8,18,2,61,56,14];
+const rotl = (v,n) => n === 0n ? v : ((v << n) | (v >> (64n - n))) & M;
+function keccakF(A){
+  for (let r=0;r<24;r++){
+    const C=new Array(5);
+    for(let x=0;x<5;x++) C[x]=A[x]^A[x+5]^A[x+10]^A[x+15]^A[x+20];
+    const D=new Array(5);
+    for(let x=0;x<5;x++) D[x]=C[(x+4)%5]^rotl(C[(x+1)%5],1n);
+    for(let x=0;x<5;x++) for(let y=0;y<5;y++) A[x+5*y]^=D[x];
+    const B=new Array(25).fill(0n);
+    for(let x=0;x<5;x++) for(let y=0;y<5;y++)
+      B[y+5*((2*x+3*y)%5)] = rotl(A[x+5*y], BigInt(ROT[x+5*y]));
+    for(let x=0;x<5;x++) for(let y=0;y<5;y++)
+      A[x+5*y] = B[x+5*y] ^ ((~B[((x+1)%5)+5*y] & M) & B[((x+2)%5)+5*y]);
+    A[0]^=RC[r];
+  }
+}
+function keccak256(bytes){
+  const RATE=136;
+  const p=new Uint8Array(Math.ceil((bytes.length+1)/RATE)*RATE);
+  p.set(bytes); p[bytes.length]=0x01; p[p.length-1]|=0x80;
+  const A=new Array(25).fill(0n);
+  for(let off=0;off<p.length;off+=RATE){
+    for(let i=0;i<RATE/8;i++){
+      let lane=0n;
+      for(let b=7;b>=0;b--) lane=(lane<<8n)|BigInt(p[off+i*8+b]);
+      A[i]^=lane;
+    }
+    keccakF(A);
+  }
+  let out="";
+  for(let i=0;i<4;i++){ let l=A[i];
+    for(let b=0;b<8;b++){ out+=(l&0xffn).toString(16).padStart(2,"0"); l>>=8n; } }
+  return "0x"+out;
+}
+const utf8 = s => new TextEncoder().encode(s);
+const hexBytes = h => { const s=h.slice(2); const o=new Uint8Array(s.length/2);
+  for(let i=0;i<o.length;i++) o[i]=parseInt(s.substr(i*2,2),16); return o; };
+const bytesHex = b => "0x" + Array.from(b, x => x.toString(16).padStart(2,"0")).join("");
+
+/* ---------- canonical JSON (RFC 8785), the same rules as the server ---------- */
+function canonicalJson(value){
+  if (value === null || typeof value === "boolean" || typeof value === "string") return JSON.stringify(value);
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new Error("non-finite number");
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) return "[" + value.map(canonicalJson).join(",") + "]";
+  if (typeof value !== "object") throw new Error("not JSON: " + typeof value);
+  return "{" + Object.keys(value).sort().map(k => {
+    if (value[k] === undefined) throw new Error("undefined value at " + k);
+    return JSON.stringify(k) + ":" + canonicalJson(value[k]);
+  }).join(",") + "}";
+}
+const recordLeaf = record => keccak256(utf8(canonicalJson(record)));
+
+/* ---------- post text: the same normalisation as the server's postText.ts ---------- */
+// Decode &amp; &lt; &gt;, apply NFKC, remove invisible characters, split on
+// whitespace, drop links and leading @handles, join with single spaces. Case,
+// punctuation and emoji are kept. See postText.ts for why each step exists.
+const ENTITIES = { "&amp;": "&", "&lt;": "<", "&gt;": ">" };
+const INVISIBLE = /[\u00AD\u200B\u200E\u200F\u202A-\u202E\u2060-\u2064\u2066-\u2069\uFE0E\uFE0F\uFEFF]/g;
+const LINK = /:\/\/|^[^\p{L}\p{N}]*(?:www\.|(?:[\p{L}\p{N}-]+\.)+\p{L}{2,}(?:\/|[^\p{L}\p{N}]*$))/iu;
+const HANDLE = /^@[A-Za-z0-9_]+$/;
+function normalisePostText(text){
+  const words = text
+    .replace(/&(?:amp|lt|gt);/g, e => ENTITIES[e])
+    .normalize("NFKC")
+    .replace(INVISIBLE, "")
+    .split(/[\s\u0085]+/)
+    .filter(w => w !== "" && !LINK.test(w));
+  let start = 0;
+  while (start < words.length && HANDLE.test(words[start])) start++;
+  return words.slice(start).join(" ");
+}
+const postTextHash = text => keccak256(utf8(normalisePostText(text)));
+const EMPTY_TEXT_HASH = keccak256(new Uint8Array(0));
+
+/* ---------- the post's photos: the same variants as the server's postImages.ts ---------- */
+// X re-encodes a photo once, at upload, into fixed sizes and formats, and
+// serves each with the same bytes from then on. The record hashes four: the
+// original JPEG, and the three WebP sizes X's own page loads, which are what
+// an archive capture of the post holds. Any other copy is a different file.
+const IMAGE_VARIANTS = { jpgOrig: "format=jpg&name=orig", webpLarge: "format=webp&name=large",
+  webpMedium: "format=webp&name=medium", webpSmall: "format=webp&name=small" };
+const VARIANT_LABELS = { jpgOrig: "original JPEG", webpLarge: "large WebP", webpMedium: "medium WebP", webpSmall: "small WebP" };
+const MEDIA_NAME = /^[A-Za-z0-9_-]{1,64}$/;
+const imageUrl = (media, variant) => "https://pbs.twimg.com/media/" + media + "?" + IMAGE_VARIANTS[variant];
+const validImages = images => Array.isArray(images) && images.every(i => i !== null && typeof i === "object" &&
+  typeof i.media === "string" && MEDIA_NAME.test(i.media) &&
+  Object.keys(IMAGE_VARIANTS).every(v => typeof i[v] === "string" && /^0x[0-9a-f]{64}$/.test(i[v])));
+// Which of the record's photos a file is, and which variant, found by its hash.
+function matchImage(images, bytes){
+  const hash = keccak256(bytes);
+  for (let i = 0; i < images.length; i++)
+    for (const variant of Object.keys(IMAGE_VARIANTS))
+      if (images[i][variant] === hash) return { index: i, variant, hash };
+  return { index: -1, variant: null, hash };
+}
+// The Wayback Machine sometimes stores an image gzip-compressed, so a raw
+// download from it can be the compressed bytes. Those are unzipped first.
+const isGzip = b => b.length > 2 && b[0] === 0x1f && b[1] === 0x8b;
+async function gunzip(bytes){
+  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("gzip"));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+/* ---------- post time: read from the X post id, the same rule as the server's postTime.ts ---------- */
+// An X post's id holds the millisecond it was posted: all but its lowest 22
+// bits count milliseconds from X's epoch, 4 November 2010, 01:42:54.657 UTC.
+// Ids from before then only count up and hold no time; they read as times in
+// that first day, so that day is not read.
+const X_EPOCH_MS = 1288834974657n;
+const FIRST_READABLE_MS = X_EPOCH_MS + 86400000n;
+const X_LINK = /^https:\/\/(?:www\.|mobile\.)?(?:x|twitter)\.com(?:[/:?#]|$)/i;
+const X_POST_LINK = /^https:\/\/(?:www\.|mobile\.)?(?:x|twitter)\.com\/(?:i\/web|i|[a-z0-9_]{1,15})\/status(?:es)?\/(\d{1,19})(?:[/?#]|$)/i;
+const isXLink = url => X_LINK.test(url);
+function xPostTime(sourceUrl){
+  const match = X_POST_LINK.exec(sourceUrl);
+  if (!match) return null;
+  const ms = (BigInt(match[1]) >> 22n) + X_EPOCH_MS;
+  return { id: match[1], at: ms < FIRST_READABLE_MS ? null : new Date(Number(ms)).toISOString() };
+}
+// As precise as X's API, which gives post times to the second.
+const sameSecond = (a, b) => Math.floor(Date.parse(a) / 1000) === Math.floor(Date.parse(b) / 1000);
+
+/* ---------- archived copies: the same reader as the server's archivedPost.ts ---------- */
+// Who wrote a post, and what it said, read from an archived copy of its page.
+// The record names its caller by numeric X id, and once the post is deleted
+// only a copy someone else holds can show that this account wrote it. X's
+// pages have held the post in four shapes: the old server-rendered pages, the
+// API response an archive saved beside an empty page, the page's embedded
+// state, and since June 2026 its serialised data store. A fifth is the answer
+// X's own embed widget reads a post from, which the archive saves when it
+// won't save X's pages; it holds a long post cut short, so such a copy is
+// refused. The post is found by its own id, never as the first post on the
+// page. The page is read as text and nothing in it is run or shown: the data
+// store is JavaScript, so its literal parts are parsed and any code is
+// skipped. A page whose copies of the post disagree, or which holds it in any
+// other shape, is unreadable.
+const SHAPE_NAMES = { "legacy-html": "old-style page", "api-response": "API response", "initial-state": "embedded state", "data-store": "data store", "embed-json": "embed JSON" };
+
+function readArchivedPost(page, postId){
+  if (!/^\d{1,19}$/.test(postId)) return { ok: false, reason: JSON.stringify(postId) + " is not an X post id" };
+  const found = [];
+  const start = page.trimStart();
+  if (start.startsWith("{")) {
+    let json;
+    try { json = JSON.parse(start); }
+    catch { return { ok: false, reason: "the file starts like an API response from X but is not valid JSON" }; }
+    found.push(isEmbedJson(json) ? fromEmbedJson(json, postId) : fromPostObjects(plainStore([json]), postId, "api-response"));
+  } else {
+    found.push(fromLegacyHtml(page, postId), fromInitialState(page, postId), fromDataStore(page, postId));
+  }
+  const problem = found.find(f => typeof f === "string");
+  if (problem !== undefined) return { ok: false, reason: problem };
+  const posts = found.filter(f => f !== null && typeof f === "object");
+  if (posts.length === 0) return { ok: false, reason: noPostReason(page, postId) };
+  const authors = new Set(posts.map(p => p.authorId));
+  if (authors.size > 1) return { ok: false, reason: "the page's copies of post " + postId + " name different authors: " + posts.map(p => SHAPE_NAMES[p.shape] + " " + p.authorId).join(", ") };
+  if (new Set(posts.map(p => normalisePostText(p.text))).size > 1) return { ok: false, reason: "the page's copies of post " + postId + " hold different text" };
+  const withHandle = posts.find(p => p.handle !== null);
+  return { ok: true, post: Object.assign({}, posts[0], { handle: withHandle ? withHandle.handle : null }) };
+}
+function noPostReason(page, postId){
+  if (/window\.__INITIAL_STATE__\s*=/.test(page) || /<script\b[^>]*\bsrc="[^"]*abs\.twimg\.com\/responsive-web\//.test(page))
+    return "the page holds no copy of post " + postId + ": X's app loads it afterwards from X's API, so give the archive's copy of that API response instead, if it saved one";
+  return "the page holds no copy of post " + postId;
+}
+// Whether an archived copy names the record's caller as the post's author, and
+// whether its text hashes to the record's text hash.
+function checkArchivedCopy(record, page){
+  const source = xPostTime(String(record.sourceUrl || ""));
+  if (!source) return { readable: false, reason: "only an X post's archived page can be read, and this record's source is not an X post" };
+  const reading = readArchivedPost(page, source.id);
+  if (!reading.ok) return { readable: false, reason: reading.reason };
+  const post = reading.post;
+  return { readable: true, post, author: "x:" + post.authorId === record.callerId,
+    text: postTextHash(post.text) === String(record.textHash || "").toLowerCase(), compared: normalisePostText(post.text) };
+}
+// The Wayback Machine sometimes stores a page compressed, and a raw download
+// of it is then the compressed bytes.
+async function archivedPageText(bytes){
+  return new TextDecoder("utf-8").decode(isGzip(bytes) ? await gunzip(bytes) : bytes);
+}
+// A snapshot's raw address serves the page exactly as captured.
+function rawArchiveUrl(url){
+  const match = /^https:\/\/web\.archive\.org\/web\/(\d{4,14})(?:[a-z]{2}_)?\/(https?:\/\/.+)$/.exec(url);
+  return match ? "https://web.archive.org/web/" + match[1] + "id_/" + match[2] : null;
+}
+
+// legacy-html
+const TAG_RE = /<([a-zA-Z][a-zA-Z0-9]*)\b((?:[^>"']|"[^"]*"|'[^']*')*)>/g;
+const ATTR_RE = /([^\s=/>]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+)))?/g;
+function attributes(source){
+  const attrs = new Map();
+  for (const m of source.matchAll(ATTR_RE)) {
+    const name = m[1].toLowerCase();
+    if (!attrs.has(name)) attrs.set(name, m[2] ?? m[3] ?? m[4] ?? "");
+  }
+  return attrs;
+}
+const tagsOf = html => [...html.matchAll(TAG_RE)].map(m => ({ name: m[1].toLowerCase(), attrs: attributes(m[2]), start: m.index, end: m.index + m[0].length }));
+const classes = tag => (tag.attrs.get("class") ?? "").split(/\s+/);
+function fromLegacyHtml(page, postId){
+  const all = tagsOf(page).filter(t => t.attrs.has("data-tweet-id"));
+  const own = all.filter(t => t.attrs.get("data-tweet-id") === postId && t.attrs.has("data-user-id"));
+  if (own.length === 0) return null;
+  const authors = new Set(own.map(t => t.attrs.get("data-user-id")));
+  if (authors.size > 1) return "the old-style page names more than one author for post " + postId + ": " + [...authors].join(", ");
+  const authorId = [...authors][0];
+  if (!/^\d{1,20}$/.test(authorId)) return "the old-style page's author for post " + postId + " is not a numeric X id";
+  const element = own.find(t => classes(t).includes("permalink-tweet")) ?? own[0];
+  // The first tweet-text paragraph after the post's element and before the
+  // next post's, so a reply or a quoted post never stands in for it.
+  const next = all.find(t => t.start > element.start && t.attrs.get("data-tweet-id") !== postId);
+  const limit = next ? next.start : page.length;
+  const paragraph = tagsOf(page.slice(element.end, limit)).find(t => t.name === "p" && classes(t).includes("tweet-text"));
+  if (!paragraph) return "the old-style page names the author of post " + postId + " but holds no text for it";
+  const from = element.end + paragraph.end, close = page.indexOf("</p>", from);
+  if (close < 0 || close > limit) return "the old-style page's text for post " + postId + " is not closed";
+  let text;
+  try { text = postTextFromHtml(page.slice(from, close)); }
+  catch (e) { return "the old-style page's text for post " + postId + " could not be read: " + e.message; }
+  const handle = element.attrs.get("data-screen-name");
+  return { shape: "legacy-html", postId, authorId, handle: handle ? decodeEntities(handle) : null, text };
+}
+// A post's text from its HTML, as a browser shows it and a reader copies it:
+// hidden elements removed, t.co links as the address X's API gives, emoji
+// images as their alt text, line breaks as new lines, every other tag removed
+// without a space, and entities decoded.
+function postTextFromHtml(html){
+  let out = removeHidden(html);
+  out = out.replace(/<a\b((?:[^>"']|"[^"]*"|'[^']*')*)>([\s\S]*?)<\/a\s*>/gi, (_, attrs, inner) => {
+    const href = attributes(attrs).get("href");
+    return href !== undefined && /^https?:\/\/t\.co\//i.test(decodeEntities(href)) ? href : inner;
+  });
+  out = out.replace(/<img\b((?:[^>"']|"[^"]*"|'[^']*')*)>/gi, (_, attrs) => attributes(attrs).get("alt") ?? "");
+  out = out.replace(/<br\b(?:[^>"']|"[^"]*"|'[^']*')*>/gi, "\n");
+  out = out.replace(/<\/?[a-zA-Z][a-zA-Z0-9]*\b(?:[^>"']|"[^"]*"|'[^']*')*>/g, "");
+  return decodeEntities(out);
+}
+const VOID_ELEMENTS = new Set(["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"]);
+const isHidden = tag => classes(tag).includes("u-hidden") || tag.attrs.has("hidden") || /display\s*:\s*none/i.test(tag.attrs.get("style") ?? "");
+function removeHidden(html){
+  for (;;) {
+    const hidden = tagsOf(html).find(isHidden);
+    if (!hidden) return html;
+    let end = hidden.end;
+    if (!VOID_ELEMENTS.has(hidden.name) && !html.slice(hidden.start, hidden.end).endsWith("/>")) {
+      const same = new RegExp("<(/?)" + hidden.name + "\\b(?:[^>\"']|\"[^\"]*\"|'[^']*')*>", "gi");
+      same.lastIndex = hidden.end;
+      let depth = 1, m;
+      while (depth > 0 && (m = same.exec(html))) { depth += m[1] ? -1 : 1; end = m.index + m[0].length; }
+      if (depth > 0) throw new Error("a hidden <" + hidden.name + "> is never closed");
+    }
+    html = html.slice(0, hidden.start) + html.slice(end);
+  }
+}
+const NAMED_ENTITIES = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: "\u00A0", shy: "\u00AD", lrm: "\u200E", rlm: "\u200F",
+  zwj: "\u200D", zwnj: "\u200C", ndash: "\u2013", mdash: "\u2014", hellip: "\u2026", lsquo: "\u2018", rsquo: "\u2019",
+  ldquo: "\u201C", rdquo: "\u201D", laquo: "\u00AB", raquo: "\u00BB", middot: "\u00B7", bull: "\u2022", copy: "\u00A9",
+  reg: "\u00AE", trade: "\u2122", deg: "\u00B0", times: "\u00D7", divide: "\u00F7", euro: "\u20AC", pound: "\u00A3",
+  yen: "\u00A5", cent: "\u00A2", sect: "\u00A7", para: "\u00B6", plusmn: "\u00B1", frac12: "\u00BD", frac14: "\u00BC",
+  frac34: "\u00BE", larr: "\u2190", rarr: "\u2192", uarr: "\u2191", darr: "\u2193" };
+function decodeEntities(text){
+  return text.replace(/&(#[0-9]{1,7}|#[xX][0-9a-fA-F]{1,6}|[a-zA-Z][a-zA-Z0-9]{1,31});/g, (whole, name) => {
+    if (name[0] === "#") {
+      const code = name[1] === "x" || name[1] === "X" ? parseInt(name.slice(2), 16) : parseInt(name.slice(1), 10);
+      if (code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff)) throw new Error(whole + " is not a character");
+      return String.fromCodePoint(code);
+    }
+    if (!Object.hasOwn(NAMED_ENTITIES, name)) throw new Error("the page uses an entity the reader doesn't know: " + whole);
+    return NAMED_ENTITIES[name];
+  });
+}
+
+// initial-state
+function fromInitialState(page, postId){
+  const at = /window\.__INITIAL_STATE__\s*=\s*/.exec(page);
+  if (!at) return null;
+  const start = at.index + at[0].length;
+  const end = page[start] === "{" ? jsonEnd(page, start) : -1;
+  if (end < 0) return "the page's embedded state is not a JSON object";
+  let state;
+  try { state = JSON.parse(page.slice(start, end)); }
+  catch { return "the page's embedded state is not valid JSON"; }
+  const tweet = field(field(field(field(state, "entities"), "tweets"), "entities"), postId);
+  if (!isRecord(tweet)) return null;
+  const authorId = idString(tweet.user) ?? idString(tweet.user_id_str);
+  if (authorId === null) return "the page's embedded state holds post " + postId + " but not its author";
+  const user = field(field(field(field(state, "entities"), "users"), "entities"), authorId);
+  if (isRecord(user) && user.id_str !== undefined && idString(user.id_str) !== authorId) return "the page's embedded state disagrees with itself about who wrote post " + postId;
+  const text = noteText(tweet.note_tweet, v => v) ?? stringOrNull(tweet.full_text);
+  if (text === null) return "the page's embedded state holds post " + postId + " but not its text";
+  return { shape: "initial-state", postId, authorId, handle: stringOrNull(field(user, "screen_name")), text: decodeNumericReferences(text) };
+}
+function jsonEnd(text, start){
+  let depth = 0, inString = false;
+  for (let i = start; i < text.length; i++) {
+    const c = text[i];
+    if (inString) { if (c === "\\") i++; else if (c === '"') inString = false; }
+    else if (c === '"') inString = true;
+    else if (c === "{" || c === "[") depth++;
+    else if (c === "}" || c === "]") { depth--; if (depth === 0) return i + 1; }
+  }
+  return -1;
+}
+
+// api-response and data-store: X's post objects, __typename "Tweet". A copy
+// of the post counts only if it names its author: a page can also hold a
+// placeholder of it with no author and empty text. Every copy that counts
+// must agree.
+function fromDataStore(page, postId){
+  if (!page.includes('__typename:"Tweet"')) return null;
+  let store;
+  try { store = dataStore(page); }
+  catch (e) { return "the page's data store could not be read: " + e.message; }
+  return fromPostObjects(store, postId, "data-store");
+}
+function fromPostObjects(store, postId, shape){
+  const name = SHAPE_NAMES[shape];
+  const posts = store.objects.filter(o => o.__typename === "Tweet" && o.rest_id === postId);
+  if (posts.length === 0) return null;
+  const fields = posts.map(post => postFields(store, post));
+  if (fields.some(r => r.conflict)) return "the " + name + " disagrees with itself about who wrote post " + postId;
+  const read = fields.filter(r => r.authorId !== null);
+  const authors = new Set(read.map(r => r.authorId));
+  if (authors.size === 0) return "the " + name + " holds post " + postId + " but not its author";
+  if (authors.size > 1) return "the " + name + " names more than one author for post " + postId + ": " + [...authors].join(", ");
+  const texts = read.map(r => r.text).filter(t => t !== null);
+  if (texts.length === 0) return "the " + name + " holds post " + postId + " but not its text";
+  if (new Set(texts.map(normalisePostText)).size > 1) return "the " + name + " holds more than one text for post " + postId;
+  const withHandle = read.find(r => r.handle !== null);
+  return { shape, postId, authorId: [...authors][0], handle: withHandle ? withHandle.handle : null, text: texts[0] };
+}
+function postFields(store, post){
+  const d = v => store.deref(v);
+  const results = d(field(d(post.core), "user_results"));
+  const user = d(field(results, "result"));
+  const legacy = d(post.legacy);
+  const ids = [idString(field(results, "rest_id")), idString(field(user, "rest_id")), idString(field(legacy, "user_id_str"))].filter(id => id !== null);
+  const handle = stringOrNull(field(d(field(user, "core")), "screen_name")) ?? stringOrNull(field(d(field(user, "legacy")), "screen_name"));
+  const text = noteText(post.note_tweet, d) ?? stringOrNull(field(d(post.details), "full_text")) ?? stringOrNull(field(legacy, "full_text"));
+  return { authorId: ids[0] ?? null, handle, text: text === null ? null : decodeNumericReferences(text), conflict: new Set(ids).size > 1 };
+}
+// X's post text in its own data escapes &, < and > as entities, which the
+// text rule decodes, and since 2026 its pages also write an apostrophe as
+// &#x27;. Numeric references are decoded here. A literal "&#x27;" in a post
+// reaches the page as "&amp;#x27;", so nothing is decoded twice.
+const decodeNumericReferences = text => text.replace(/&#([0-9]{1,7}|[xX][0-9a-fA-F]{1,6});/g, (whole, ref) => {
+  const code = ref[0] === "x" || ref[0] === "X" ? parseInt(ref.slice(1), 16) : parseInt(ref, 10);
+  return code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff) ? whole : String.fromCodePoint(code);
+});
+// A long post's full text, which X keeps apart from the cut-down full_text.
+const noteText = (note, d) => stringOrNull(field(d(field(d(field(d(note), "note_tweet_results")), "result")), "text"));
+const plainStore = roots => ({ objects: walkObjects(roots), deref: v => v });
+
+// embed-json: the post at the top of X's embed answer, or a tombstone once it
+// is gone. A quoted post or a reply's parent sits inside it and is never read
+// as the post. Asked for a retweet, X answers with the post retweeted, which
+// someone else wrote, so the id must be the post's own. For a long post the
+// answer holds only about the first 280
+// characters, and note_tweet holds just an id, so the copy is refused.
+const isEmbedJson = json => isRecord(json) && (json.__typename === "Tweet" || json.__typename === "TweetTombstone");
+function fromEmbedJson(json, postId){
+  if (json.__typename === "TweetTombstone") return "the embed JSON holds only X's notice that the post was unavailable when it was saved, so it can't show post " + postId;
+  if (json.id_str !== postId) return null;
+  const authorId = idString(field(json.user, "id_str"));
+  if (authorId === null) return "the embed JSON holds post " + postId + " but not its author";
+  if (json.note_tweet !== undefined && json.note_tweet !== null)
+    return "the embed JSON holds only the first 280 or so characters of post " + postId + ", which is a long post, so its text can't be checked from it; a copy of the post's page holds all of it";
+  const text = stringOrNull(json.text);
+  if (text === null) return "the embed JSON holds post " + postId + " but not its text";
+  return { shape: "embed-json", postId, authorId, handle: stringOrNull(field(json.user, "screen_name")), text: decodeNumericReferences(text) };
+}
+
+// The data store's literal parser: objects, arrays, strings, numbers, !0 and
+// !1, null, void 0, and seroval's $R[n]=value and $R[n]. Anything else is
+// skipped to the next delimiter as an opaque value, never run.
+class StoreRef { constructor(n){ this.n = n; } }
+const OPAQUE = Symbol("opaque");
+const DELIMITERS = new Set([",", "}", "]", ")", ";"]);
+const SIMPLE_ESCAPES = { n: "\n", r: "\r", t: "\t", b: "\b", f: "\f", v: "\v" };
+class StoreParser {
+  constructor(s, refs){ this.s = s; this.refs = refs; this.i = 0; }
+  value(){
+    this.space();
+    const s = this.s, c = s[this.i];
+    if (c === "{") return this.continued(this.object());
+    if (c === "[") return this.continued(this.array());
+    if (c === '"' || c === "'") return this.continued(this.string());
+    const ref = /^\$R\[(\d{1,9})\]/.exec(s.slice(this.i, this.i + 16));
+    if (ref) {
+      this.i += ref[0].length;
+      this.space();
+      const n = Number(ref[1]);
+      if (s[this.i] === "=" && s[this.i + 1] !== "=") {
+        this.i++;
+        const value = this.value();
+        this.refs.set(n, value);
+        return value;
+      }
+      return this.continued(new StoreRef(n));
+    }
+    const word = /^(?:!0|!1|void 0|null|true|false|-?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)(?![\w$])/.exec(s.slice(this.i, this.i + 32));
+    if (word) {
+      this.i += word[0].length;
+      const w = word[0];
+      return this.continued(w === "!0" || w === "true" ? true : w === "!1" || w === "false" ? false : w === "null" ? null : w === "void 0" ? undefined : Number(w));
+    }
+    this.skip();
+    return OPAQUE;
+  }
+  space(){ while (this.i < this.s.length && /\s/.test(this.s[this.i])) this.i++; }
+  // A value followed by more of an expression, such as $R[81].next(…), is opaque.
+  continued(value){
+    this.space();
+    if (this.i >= this.s.length || DELIMITERS.has(this.s[this.i])) return value;
+    this.skip();
+    return OPAQUE;
+  }
+  object(){
+    const s = this.s, out = Object.create(null);
+    this.i++;
+    for (;;) {
+      this.space();
+      if (s[this.i] === "}") { this.i++; return out; }
+      let key;
+      const c = s[this.i];
+      if (c === '"' || c === "'") key = this.string();
+      else if (s.startsWith("...", this.i)) { this.i += 3; this.value(); key = null; }
+      else if (c === "[") { this.group(); key = null; }
+      else {
+        const m = /^(?:[A-Za-z_$][\w$]*|\d+(?:\.\d+)?)/.exec(s.slice(this.i, this.i + 256));
+        if (!m) throw new Error("unexpected \"" + (c ?? "end") + "\" in an object at " + this.i);
+        this.i += m[0].length;
+        key = m[0];
+      }
+      this.space();
+      if (s[this.i] === ":") { this.i++; const value = this.value(); if (key !== null) out[key] = value; }
+      else if (s[this.i] === "(" || /[A-Za-z_$]/.test(s[this.i] ?? "")) { this.skip(); if (key !== null) out[key] = OPAQUE; }
+      else if (key !== null) out[key] = OPAQUE;
+      this.space();
+      if (s[this.i] === ",") this.i++;
+      else if (s[this.i] !== "}") throw new Error("unexpected \"" + (s[this.i] ?? "end") + "\" after a key in an object at " + this.i);
+    }
+  }
+  array(){
+    const s = this.s, out = [];
+    this.i++;
+    for (;;) {
+      this.space();
+      if (s[this.i] === "]") { this.i++; return out; }
+      if (s[this.i] === ",") { out.push(undefined); this.i++; continue; }
+      out.push(this.value());
+      this.space();
+      if (s[this.i] === ",") this.i++;
+      else if (s[this.i] !== "]") throw new Error("unexpected \"" + (s[this.i] ?? "end") + "\" in an array at " + this.i);
+    }
+  }
+  string(){
+    const s = this.s, quote = s[this.i];
+    let out = "";
+    this.i++;
+    for (;;) {
+      if (this.i >= s.length) throw new Error("a string is never closed");
+      const c = s[this.i];
+      if (c === quote) { this.i++; return out; }
+      if (c !== "\\") { out += c; this.i++; continue; }
+      const e = s[this.i + 1];
+      this.i += 2;
+      if (e === undefined) throw new Error("a string ends in an escape");
+      if (Object.hasOwn(SIMPLE_ESCAPES, e)) out += SIMPLE_ESCAPES[e];
+      else if (e === "0" && !/[0-9]/.test(s[this.i] ?? "")) out += "\0";
+      else if (e === "x") {
+        const hex = s.slice(this.i, this.i + 2);
+        if (!/^[0-9a-fA-F]{2}$/.test(hex)) throw new Error("a bad \\x escape at " + this.i);
+        out += String.fromCharCode(parseInt(hex, 16));
+        this.i += 2;
+      } else if (e === "u") {
+        const braced = /^\{([0-9a-fA-F]{1,6})\}/.exec(s.slice(this.i, this.i + 8));
+        const hex = braced ? braced[1] : s.slice(this.i, this.i + 4);
+        if (!braced && !/^[0-9a-fA-F]{4}$/.test(hex)) throw new Error("a bad \\u escape at " + this.i);
+        const code = parseInt(hex, 16);
+        if (code > 0x10ffff) throw new Error("a bad \\u escape at " + this.i);
+        out += String.fromCodePoint(code);
+        this.i += braced ? braced[0].length : 4;
+      } else if (e === "\r") { if (s[this.i] === "\n") this.i++; }
+      else if (e !== "\n" && e !== "\u2028" && e !== "\u2029") out += e;
+    }
+  }
+  // Skips a bracketed group, (…), […] or {…}, starting at its opening bracket.
+  group(){ const start = this.i; this.scan(true); if (this.i === start) throw new Error("expected a bracket at " + start); }
+  // Skips code to the next delimiter outside brackets and strings.
+  skip(){ this.scan(false); }
+  scan(oneGroup){
+    const s = this.s, closers = [], pairs = { "(": ")", "[": "]", "{": "}" };
+    while (this.i < s.length) {
+      const c = s[this.i];
+      if (closers.length === 0 && !oneGroup && DELIMITERS.has(c)) return;
+      if (c === '"' || c === "'" || c === "`") { this.quoted(c); continue; }
+      if (c === "/" && s[this.i + 1] === "/") { const nl = s.indexOf("\n", this.i); this.i = nl < 0 ? s.length : nl; continue; }
+      if (c === "/" && s[this.i + 1] === "*") {
+        const close = s.indexOf("*/", this.i + 2);
+        if (close < 0) throw new Error("a comment is never closed");
+        this.i = close + 2;
+        continue;
+      }
+      if (Object.hasOwn(pairs, c)) closers.push(pairs[c]);
+      else if (c === ")" || c === "]" || c === "}") {
+        if (closers.pop() !== c) throw new Error("unbalanced \"" + c + "\" at " + this.i);
+        if (oneGroup && closers.length === 0) { this.i++; return; }
+      }
+      this.i++;
+    }
+    if (closers.length > 0) throw new Error("the store ends inside brackets");
+  }
+  quoted(quote){
+    const s = this.s;
+    this.i++;
+    while (this.i < s.length && s[this.i] !== quote) this.i += s[this.i] === "\\" ? 2 : 1;
+    if (this.i >= s.length) throw new Error("a string is never closed");
+    this.i++;
+  }
+}
+function dataStore(page){
+  const refs = new Map();
+  for (const script of page.matchAll(/<script\b(?:[^>"']|"[^"]*"|'[^']*')*>([\s\S]*?)<\/script\s*>/gi)) {
+    const body = script[1];
+    if (!body.includes("$R[")) continue;
+    const parser = new StoreParser(body, refs);
+    let covered = 0;
+    for (const anchor of body.matchAll(/\$R\[\d{1,9}\]\s*=(?!=)/g)) {
+      if (anchor.index < covered) continue;
+      parser.i = anchor.index;
+      try { parser.value(); covered = parser.i; }
+      catch { /* not a literal after all, or code: try the next assignment */ }
+    }
+  }
+  const objects = walkObjects([...refs.values()]);
+  const byId = new Map();
+  for (const o of objects) if (typeof o.__id === "string" && !byId.has(o.__id)) byId.set(o.__id, o);
+  const deref = value => {
+    for (let hops = 0; hops < 64; hops++) {
+      if (value instanceof StoreRef) value = refs.get(value.n);
+      else if (isRecord(value) && typeof value.__ref === "string") value = byId.get(value.__ref);
+      else return value;
+    }
+    return undefined;
+  };
+  return { objects, deref };
+}
+function walkObjects(roots){
+  const seen = new Set(), out = [], stack = [...roots];
+  while (stack.length > 0) {
+    const v = stack.pop();
+    if (typeof v !== "object" || v === null || seen.has(v) || v instanceof StoreRef) continue;
+    seen.add(v);
+    if (Array.isArray(v)) stack.push(...v);
+    else { out.push(v); stack.push(...Object.values(v)); }
+  }
+  return out;
+}
+const isRecord = v => typeof v === "object" && v !== null && !Array.isArray(v) && !(v instanceof StoreRef);
+const field = (v, key) => isRecord(v) && Object.prototype.hasOwnProperty.call(v, key) ? v[key] : undefined;
+const stringOrNull = v => typeof v === "string" ? v : null;
+const idString = v => typeof v === "string" && /^\d{1,20}$/.test(v) ? v : null;
+
+/* ---------- Merkle proof: sorted pairs, as OpenZeppelin's MerkleProof ---------- */
+function rootFromProof(leaf, proof){
+  let node = leaf.toLowerCase();
+  for (const sibling of proof) {
+    const other = sibling.toLowerCase();
+    const pair = node < other ? node + other.slice(2) : other + node.slice(2);
+    node = keccak256(hexBytes(pair));
+  }
+  return node;
+}
+
+/* ---------- anchor calldata: "RCPT" | version | root | CID ---------- */
+function decodeAnchorPayload(data){
+  const b = hexBytes(data);
+  if (b.length <= 37) throw new Error("too short to be an anchor");
+  const tag = new TextDecoder().decode(b.subarray(0,4));
+  if (tag !== "RCPT") throw new Error("not an anchor: tag is " + JSON.stringify(tag));
+  if (b[4] !== 1) throw new Error("unsupported anchor version " + b[4]);
+  const cid = new TextDecoder("utf-8", { fatal: true }).decode(b.subarray(37));
+  if (!/^b[a-z2-7]+$/.test(cid)) throw new Error("anchor carries no CID");
+  return { version: 1, root: bytesHex(b.subarray(5,37)), cid };
+}
+
+/* ---------- chain reads ---------- */
+async function rpc(url, method, params, fetchImpl){
+  const res = await fetchImpl(url, { method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }) });
+  if (!res.ok) throw new Error(method + ": HTTP " + res.status);
+  const body = await res.json();
+  if (body.error) throw new Error(method + ": " + body.error.message);
+  return body.result;
+}
+function attestorAt(attestors, chainId, address, when){
+  const a = address.toLowerCase();
+  return attestors.find(k => k.chainId === chainId && k.address.toLowerCase() === a &&
+    new Date(k.from) <= when && (k.until === null || when < new Date(k.until)));
+}
+
+/* ---------- the whole check ---------- */
+async function verifyBundle(bundle, opts = {}){
+  const steps = [];
+  const step = (ok, title, detail) => { steps.push({ ok, title, detail }); return ok; };
+
+  let leaf;
+  try { leaf = recordLeaf(bundle.record); }
+  catch (e) { step(false, "The record could not be hashed", e.message); return steps; }
+  step(true, "Record hashed", "leaf " + leaf);
+
+  // Batch files hold hashes only, so nobody can tell which leaves belong to a
+  // caller. Each record therefore carries its own place in its caller's chain
+  // and names the record before it: a number missing from a caller's profile
+  // is a record Receipts holds and is not showing.
+  const seq = bundle.record.callerSeq, prev = bundle.record.prevLeaf;
+  const linked = Number.isSafeInteger(seq) && seq >= 1 &&
+    (seq === 1 ? prev === null : typeof prev === "string" && /^0x[0-9a-f]{64}$/.test(prev));
+  if (!linked) step(false, "The record has no valid place in its caller's chain", "callerSeq " + seq + ", prevLeaf " + prev);
+  else step(true, "Record " + seq + " in this caller's chain", seq === 1
+    ? "the first record Receipts holds about this caller"
+    : "follows the record with leaf " + prev + ". Every number from 1 to " + seq + " should appear on the caller's " +
+      "profile, shown or with the reason it is not; a missing number is a record being withheld");
+
+  // For a past call anchored after its event, the post time is the only
+  // evidence that the call came first. An X post's link holds that time, so
+  // it is read from there rather than taken from the record.
+  const source = String(bundle.record.sourceUrl || ""), postedAt = String(bundle.record.postedAt || "");
+  const post = xPostTime(source);
+  if (post && post.at !== null) {
+    if (sameSecond(postedAt, post.at)) step(true, "Posted at " + postedAt, "X post " + post.id + " was made at " + post.at + ", as its id says");
+    else step(false, "The record's post time is not the post's", "the record says " + postedAt + ", but X post " + post.id +
+      " was made at " + post.at + ", as its id says");
+  } else step(null, "Post time not checked", post
+    ? "X post " + post.id + " is from before X's post ids held a time"
+    : bundle.record.provenance === "self-logged"
+      ? "a self-logged pick is sent to Receipts directly, so the anchor's time is its evidence"
+      : isXLink(source)
+        ? "the source is an X link with no post id in it: " + source
+        : "only an X post's time can be read from its link, so for this source the time rests on the record");
+
+  const root = rootFromProof(leaf, bundle.proof || []);
+  if (!step(root === String(bundle.root).toLowerCase(),
+      "Merkle proof reaches the batch root",
+      root === String(bundle.root).toLowerCase() ? "root " + root : "proof gives " + root + ", bundle says " + bundle.root)) {
+    return steps;
+  }
+
+  // The record holds a hash of the post's text, never the text, so text from
+  // any copy of the post — the live one, an archive's, your own — can be
+  // checked against what was anchored without asking us what the post said.
+  const recorded = String(bundle.record.textHash || "").toLowerCase();
+  const pasted = typeof opts.postText === "string" ? opts.postText : "";
+  const images = validImages(bundle.record.images) ? bundle.record.images : null;
+  const copies = [bundle.record.sourceUrl].concat((bundle.archives || []).map(a => a.url)).join("  ");
+  const text = (ok, title, detail) => { steps.push({ ok, title, detail, kind: "text" }); };
+  if (!/^0x[0-9a-f]{64}$/.test(recorded)) {
+    text(false, "The record has no post text hash", "so nothing ties it to what the post said");
+  } else if (recorded === EMPTY_TEXT_HASH) {
+    // Every post without words hashes alike here, so there is nothing to
+    // compare against: pasting any other post without words would otherwise
+    // be told it matched. Receipts anchors such a record only for a post with
+    // photos, whose hashes then tie the record to the post.
+    text(null, "The post had no text to check", "the record's text hash is keccak256 of nothing, " +
+      "which every post without words shares, so its text ties this record to no particular post" +
+      (images && images.length > 0 ? "; its photos do, below" : ""));
+  } else if (pasted.trim() !== "") {
+    const compared = normalisePostText(pasted);
+    if (postTextHash(pasted) === recorded) text(true, "Post text matches the record", "compared as: " + compared);
+    else text(false, "Post text does not match the record", "compared as: " + compared);
+  } else {
+    text(null, "Post text not checked", "paste the post's text from any copy of it: " + copies);
+  }
+
+  // The record lists every photo on the post by its hashes, so a copy of a
+  // photo from anywhere (X itself, an archive, your own download) can be
+  // checked against what was anchored. Whether the chart shows the call the
+  // record describes is still yours to judge, as with the text.
+  const image = (ok, title, detail) => { steps.push({ ok, title, detail, kind: "image" }); };
+  if (!images) {
+    step(false, "The record's list of the post's photos is missing or malformed", "a record lists every photo on " +
+      "its post, by X's media name and four hashes, and an empty list for a post with none");
+  } else if (images.length === 0) {
+    step(true, "The record lists no photos on the post", "if any copy of the post shows a photo, the record is wrong");
+  } else {
+    const n = images.length;
+    const where = i => imageUrl(images[i].media, "jpgOrig");
+    const files = Array.isArray(opts.imageFiles) ? opts.imageFiles : [];
+    if (files.length === 0) {
+      image(null, n === 1 ? "The post's photo not checked" : "The post's " + n + " photos not checked",
+        "give a copy of each, saved from " + images.map((_, i) => where(i)).join("  ") + " or from the post's copies: " + copies);
+    }
+    const matched = new Set();
+    for (const file of files) {
+      let bytes = file.bytes;
+      const zipped = isGzip(bytes);
+      if (zipped) {
+        try { bytes = await gunzip(bytes); }
+        catch (e) { image(false, "Photo file " + file.name + " could not be unzipped", e.message); continue; }
+      }
+      const found = matchImage(images, bytes);
+      if (found.index >= 0) {
+        matched.add(found.index);
+        image(true, "Photo file " + file.name + " is photo " + (found.index + 1) + " of " + n,
+          "the " + VARIANT_LABELS[found.variant] + " of X photo " + images[found.index].media + ", hash " + found.hash +
+          (zipped ? "; unzipped first, as the archive stored it compressed" : ""));
+      } else {
+        image(false, "Photo file " + file.name + " matches none of the record's photos", "hash " + found.hash +
+          ". A screenshot, crop, resize or re-upload never matches: only the exact file X serves does, from " +
+          images.map((_, i) => where(i)).join("  ") + " or an archive's raw copy");
+      }
+    }
+    if (files.length > 0) for (let i = 0; i < n; i++) if (!matched.has(i)) {
+      image(null, "Photo " + (i + 1) + " of " + n + " not checked", "give a copy of it, saved from " + where(i));
+    }
+  }
+
+  // An archived copy of the post's page, held by an archive Receipts does not
+  // run, names who wrote it. The record's caller is checked against that, so
+  // whose call this is does not rest on our word once the post is gone.
+  const archiveFiles = Array.isArray(opts.archiveFiles) ? opts.archiveFiles : [];
+  // X's pages of April and May 2026 hold a long post cut short, and nothing on them says so.
+  const CUT_DOWN_COPY = "X's pages from April and May 2026, read from their embedded state as this one was, hold only about the first 280 characters of a long post, with nothing marking the cut. " +
+    "If the post was longer, this copy can't show its text: try a copy from before or after then, or X's own answer for the post";
+  const archived = (ok, title, detail, kind) => { steps.push({ ok, title, detail, kind }); };
+  if (archiveFiles.length === 0) {
+    const raws = (bundle.archives || []).map(a => rawArchiveUrl(String(a && a.url))).filter(Boolean);
+    archived(null, "Author not checked against an archived copy", raws.length > 0
+      ? "download a raw archived copy of the post from " + raws.join("  ") + " and give it here"
+      : "the bundle lists no archived copy of the post's page in the Wayback Machine", "author");
+  }
+  for (const file of archiveFiles) {
+    let page;
+    try { page = await archivedPageText(file.bytes); }
+    catch (e) { archived(null, "Archived copy " + file.name + " could not be unzipped", e.message, "archive"); continue; }
+    const result = checkArchivedCopy(bundle.record, page);
+    if (!result.readable) { archived(null, "Archived copy " + file.name + " not read", result.reason, "archive"); continue; }
+    const p = result.post;
+    const from = "read from its " + SHAPE_NAMES[p.shape] + (p.handle ? ", which shows the author as @" + p.handle : "");
+    if (result.author) archived(true, "Archived copy " + file.name + " names " + bundle.record.callerId + " as the post's author", "post " + p.postId + ", " + from, "author");
+    else archived(false, "Archived copy " + file.name + " names someone else as the post's author", "it names x:" + p.authorId +
+      ", but the record says " + bundle.record.callerId + "; post " + p.postId + ", " + from, "author");
+    if (recorded === EMPTY_TEXT_HASH && result.compared === "") {
+      archived(null, "Archived copy " + file.name + " has no text to compare", "the post had no words, as the record says", "text");
+    } else if (result.text) archived(true, "Archived copy " + file.name + "'s text matches the record", "compared as: " + result.compared, "text");
+    else archived(false, "Archived copy " + file.name + "'s text does not match the record", "compared as: " + result.compared +
+      (p.shape === "initial-state" ? ". " + CUT_DOWN_COPY : ""), "text");
+  }
+
+  const anchors = bundle.anchors || [];
+  if (anchors.length === 0) { step(false, "No anchor to check", "this receipt has not been anchored yet"); return steps; }
+  await checkAnchors(steps, anchors, root, bundle.cid, opts, i => i, (when, tx, step) =>
+    step(true, "Anchored at " + when.toISOString(), "block " + parseInt(tx.blockNumber, 16) +
+      "; the post is timestamped " + bundle.record.postedAt));
+  return steps;
+}
+
+// Reads each anchor from the chain. The three checks an anchor must pass to
+// count are tagged with its id, so the verdict can find them; afterAnchor adds
+// what else the caller wants checked against the anchor's time.
+async function checkAnchors(steps, anchors, root, cid, opts, idOf, afterAnchor){
+  const fetchImpl = opts.fetch || globalThis.fetch.bind(globalThis);
+  const rpcs = Object.assign({}, RPC_BY_CHAIN, opts.rpcByChain || {});
+  const attestors = opts.attestors || ANCHOR_ATTESTORS;
+  const step = (ok, title, detail) => { steps.push({ ok, title, detail }); return ok; };
+  for (let i = 0; i < anchors.length; i++) {
+    const anchor = anchors[i];
+    const check = (name, ok, title, detail) => { steps.push({ ok, title, detail, anchor: idOf(i), check: name }); return ok; };
+    const label = anchor.transport + " " + anchor.txHash;
+    const url = rpcs[anchor.chainId];
+    if (!url) { step(null, "Anchor on chain " + anchor.chainId + " not checked", "no RPC configured for that chain"); continue; }
+    try {
+      const chainId = parseInt(await rpc(url, "eth_chainId", [], fetchImpl), 16);
+      if (!step(chainId === anchor.chainId, "RPC is chain " + anchor.chainId, url + " reports chain " + chainId)) continue;
+      const tx = await rpc(url, "eth_getTransactionByHash", [anchor.txHash], fetchImpl);
+      if (!tx) { step(false, "Anchor transaction not found", label); continue; }
+      if (!tx.blockNumber) { step(false, "Anchor transaction not mined yet", label); continue; }
+      const payload = decodeAnchorPayload(tx.input);
+      check("root", payload.root === root, "Anchored root matches", label);
+      check("cid", payload.cid === cid, "Anchored batch file matches", "CID " + payload.cid);
+      const block = await rpc(url, "eth_getBlockByNumber", [tx.blockNumber, false], fetchImpl);
+      const when = new Date(parseInt(block.timestamp, 16) * 1000);
+      if (!attestors.some(k => k.chainId === anchor.chainId)) check("sender", null, "Anchor sender not checked against a published key",
+        "sent by " + tx.from + "; " + (attestors.length === 0
+          ? "no Receipts key is published in this verifier yet, so anyone could have sent it"
+          : "no Receipts key is published for chain " + anchor.chainId + ", so anchors there do not count"));
+      else check("sender", Boolean(attestorAt(attestors, anchor.chainId, tx.from, when)), "Anchor sent by a published Receipts key",
+        "sent by " + tx.from + " on chain " + anchor.chainId);
+      afterAnchor(when, tx, step);
+    } catch (e) {
+      step(false, "Anchor check failed", label + ": " + e.message);
+    }
+  }
+}
+
+/* ---------- the verdict ---------- */
+// One anchor is enough, but only one whose root and batch file match and whose
+// sender is a Receipts key published for that anchor's chain. An anchor from an
+// unchecked sender, or on a chain with no published key, shows only that
+// someone hashed this record, not that Receipts committed to it, so it never
+// earns "verifies".
+function summarise(steps){
+  // Text or a photo that doesn't match is a reader's copy failing, not the
+  // receipt. An archived copy naming someone else is the record being wrong
+  // about whose call it is, so it gets a verdict of its own below.
+  if (steps.some(s => s.ok === false && s.kind !== "text" && s.kind !== "image" && s.kind !== "author")) {
+    return { verdict: "failed", message: "This receipt did not verify." };
+  }
+  const anchors = {};
+  for (const s of steps) if (s.check) (anchors[s.anchor] = anchors[s.anchor] || {})[s.check] = s.ok;
+  const checked = Object.values(anchors);
+  if (!checked.some(a => a.root === true && a.cid === true && a.sender === true)) {
+    return checked.some(a => a.sender === null)
+      ? { verdict: "sender-unchecked", message: "Not verified: the record matches what was anchored, but the anchor's sender is not a published Receipts key, so this does not show that Receipts anchored it." }
+      : { verdict: "unchecked", message: "Not verified: no anchor could be checked." };
+  }
+  if (steps.some(s => s.ok === false && s.kind === "author")) {
+    return { verdict: "author-mismatch", message: "The receipt checks out, but an archived copy of the post names someone else as its author, so the record is wrong about whose call this is." };
+  }
+  if (steps.some(s => s.ok === false && s.kind === "text")) {
+    return { verdict: "text-mismatch", message: "The receipt checks out, but that text is not what it committed to." };
+  }
+  if (steps.some(s => s.ok === false)) {
+    return { verdict: "image-mismatch", message: "The receipt checks out, but that photo is not one it committed to." };
+  }
+  return { verdict: "verified", message: "This receipt verifies." };
+}
+
+/* ---------- settlements: the same rules, baselines and file reading as the server's src/settlement/ ---------- */
+// A settlement names the claim it settles, the rule and baseline model with
+// their versions, and the data both read. The verifier re-runs the rule and
+// the baseline over that data, so the outcome and the baseline follow from
+// the record or the settlement fails. Data held in Binance's published files
+// is checked against the checksum the record cites, which is the one Binance
+// publishes beside each file. Each rule reads a fixed list of sources, and a
+// settlement holds data from each or says why it left one out, so a source
+// that disagreed cannot be dropped without a trace.
+
+const DAY_MS = 86400000, MINUTE_MS = 60000;
+
+// SHA-256, dependency-free, because Binance publishes SHA-256 checksums.
+const K256 = [0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2];
+const ror = (x, n) => (x >>> n) | (x << (32 - n));
+function sha256(bytes){
+  const n = bytes.length, padded = Math.ceil((n + 9) / 64) * 64;
+  const m = new Uint8Array(padded); m.set(bytes); m[n] = 0x80;
+  const bits = n * 8, high = Math.floor(bits / 4294967296);
+  for (let i = 0; i < 4; i++) m[padded - 1 - i] = (bits >>> (8 * i)) & 0xff;
+  for (let i = 0; i < 4; i++) m[padded - 5 - i] = (high >>> (8 * i)) & 0xff;
+  const h = [0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19];
+  const w = new Array(64);
+  for (let off = 0; off < padded; off += 64) {
+    for (let i = 0; i < 16; i++) w[i] = ((m[off+i*4] << 24) | (m[off+i*4+1] << 16) | (m[off+i*4+2] << 8) | m[off+i*4+3]) >>> 0;
+    for (let i = 16; i < 64; i++) {
+      const s0 = ror(w[i-15], 7) ^ ror(w[i-15], 18) ^ (w[i-15] >>> 3);
+      const s1 = ror(w[i-2], 17) ^ ror(w[i-2], 19) ^ (w[i-2] >>> 10);
+      w[i] = (w[i-16] + s0 + w[i-7] + s1) >>> 0;
+    }
+    let [a, b, c, d, e, f, g, k] = h;
+    for (let i = 0; i < 64; i++) {
+      const t1 = (k + (ror(e, 6) ^ ror(e, 11) ^ ror(e, 25)) + ((e & f) ^ (~e & g)) + K256[i] + w[i]) >>> 0;
+      const t2 = ((ror(a, 2) ^ ror(a, 13) ^ ror(a, 22)) + ((a & b) ^ (a & c) ^ (b & c))) >>> 0;
+      k = g; g = f; f = e; e = (d + t1) >>> 0; d = c; c = b; b = a; a = (t1 + t2) >>> 0;
+    }
+    h[0] = (h[0] + a) >>> 0; h[1] = (h[1] + b) >>> 0; h[2] = (h[2] + c) >>> 0; h[3] = (h[3] + d) >>> 0;
+    h[4] = (h[4] + e) >>> 0; h[5] = (h[5] + f) >>> 0; h[6] = (h[6] + g) >>> 0; h[7] = (h[7] + k) >>> 0;
+  }
+  return h.map(x => x.toString(16).padStart(8, "0")).join("");
+}
+
+// Binance's zips hold one CSV each. Its place is read from the zip's
+// directory, and the browser's own DecompressionStream inflates it.
+const u16 = (b, at) => b[at] | (b[at+1] << 8);
+const u32 = (b, at) => (b[at] | (b[at+1] << 8) | (b[at+2] << 16) | (b[at+3] << 24)) >>> 0;
+function zipEntry(zip){
+  let end = -1;
+  for (let i = zip.length - 22; i >= Math.max(0, zip.length - 22 - 65535); i--) if (u32(zip, i) === 0x06054b50) { end = i; break; }
+  if (end < 0) throw new Error("not a zip file");
+  if (u16(zip, end + 10) !== 1) throw new Error("a Binance file holds one CSV; this zip holds " + u16(zip, end + 10) + " files");
+  const central = u32(zip, end + 16);
+  if (u32(zip, central) !== 0x02014b50) throw new Error("the zip's directory is damaged");
+  const method = u16(zip, central + 10), size = u32(zip, central + 20), local = u32(zip, central + 42);
+  if (u32(zip, local) !== 0x04034b50) throw new Error("the zip's file header is damaged");
+  if (method !== 0 && method !== 8) throw new Error("the zip uses compression method " + method + ", not deflate");
+  return { method, start: local + 30 + u16(zip, local + 26) + u16(zip, local + 28), size };
+}
+async function unzipSingle(zip){
+  const { method, start, size } = zipEntry(zip);
+  const body = zip.subarray(start, start + size);
+  if (method === 0) return body;
+  const stream = new Blob([body]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+// Open times are milliseconds in older files and microseconds from 2025.
+function parseKlines(csv){
+  return csv.split(/\r?\n/).filter(line => /^\d/.test(line)).map(line => {
+    const [time, o, h, l, c] = line.split(",");
+    const raw = Number(time);
+    return { open: raw >= 1e15 ? Math.floor(raw / 1000) : raw, o, h, l, c };
+  });
+}
+async function readBinanceFile(zip, kind){
+  const rows = parseKlines(new TextDecoder().decode(await unzipSingle(zip)));
+  return kind === "minute-candles"
+    ? rows.map(k => ({ t: new Date(k.open).toISOString(), o: k.o, h: k.h, l: k.l, c: k.c }))
+    : rows.map(k => ({ day: new Date(k.open).toISOString().slice(0, 10), stamp: new Date(k.open).toISOString(), close: k.c }));
+}
+
+const isDecimal = v => typeof v === "string" && /^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$/.test(v) && Number(v) > 0;
+const num = v => Number(v);
+const dayStart = day => Date.parse(day + "T00:00:00.000Z");
+const closeTime = point => dayStart(point.day) + DAY_MS;
+const dayOf = ms => new Date(ms).toISOString().slice(0, 10);
+const isoOf = ms => new Date(ms).toISOString();
+function checkDailyCloses(points){
+  points.forEach((point, i) => {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(point.day) || Number.isNaN(dayStart(point.day))) throw new Error("not a UTC day: \"" + point.day + "\"");
+    if (!isDecimal(point.close)) throw new Error("close for " + point.day + " is not a positive decimal: \"" + point.close + "\"");
+    if (typeof point.stamp !== "string" || Number.isNaN(Date.parse(point.stamp))) throw new Error("close for " + point.day + " has no stamp");
+    if (i > 0 && dayStart(point.day) - dayStart(points[i-1].day) !== DAY_MS) throw new Error("daily closes must run one a day with no gaps: " + points[i-1].day + " then " + point.day);
+  });
+}
+function checkCandles(candles){
+  candles.forEach((candle, i) => {
+    const t = Date.parse(candle.t);
+    if (Number.isNaN(t) || t % MINUTE_MS !== 0) throw new Error("candle time is not a whole minute: \"" + candle.t + "\"");
+    for (const field of ["o", "h", "l", "c"]) if (!isDecimal(candle[field])) throw new Error("candle " + candle.t + " has no positive decimal " + field);
+    if (num(candle.l) > num(candle.h)) throw new Error("candle " + candle.t + " has its low above its high");
+    if (i > 0 && t - Date.parse(candles[i-1].t) !== MINUTE_MS) throw new Error("minute candles must run one a minute with no gaps: " + candles[i-1].t + " then " + candle.t);
+  });
+}
+
+// The rules, as the server's src/settlement/rules.ts.
+function levelOf(condition, field){
+  const value = condition[field];
+  if (!isDecimal(value)) throw new Error("the call's " + field + " is not a positive decimal: " + JSON.stringify(value));
+  return value;
+}
+function cryptoPrice1(call, closes){
+  const condition = call.condition, direction = condition.direction;
+  if (direction !== "above" && direction !== "below") throw new Error("a price call is above or below, not " + JSON.stringify(direction));
+  const target = num(levelOf(condition, "level"));
+  const meets = close => direction === "above" ? num(close) >= target : num(close) <= target;
+  const posted = Date.parse(call.postedAt), deadline = Date.parse(call.deadline);
+  const byDay = new Map(closes.map(point => [point.day, point]));
+  if (condition.by === false) {
+    if (deadline % DAY_MS !== 0) throw new Error("an 'at a date' call needs a deadline at 00:00 UTC, when a day's close happens");
+    if (deadline <= posted) throw new Error("the call's deadline is not after its post");
+    const day = dayOf(deadline - DAY_MS), point = byDay.get(day);
+    if (!point) throw new Error("no close for " + day + ", the day the call is judged on");
+    return { outcome: meets(point.close) ? "true" : "false", decidedAt: isoOf(deadline), reason: null };
+  }
+  if (condition.by !== true) throw new Error("a price call is \"by\" or \"at\" a date; by is " + JSON.stringify(condition.by));
+  for (let start = dayStart(dayOf(posted)); start + DAY_MS <= deadline; start += DAY_MS) {
+    const point = byDay.get(dayOf(start));
+    if (!point) throw new Error("no close for " + dayOf(start) + ", so nothing has decided the call yet");
+    if (meets(point.close)) return { outcome: "true", decidedAt: isoOf(closeTime(point)), reason: null };
+  }
+  return { outcome: "false", decidedAt: isoOf(deadline), reason: null };
+}
+function cryptoTrade1(call, candles){
+  const condition = call.condition, long = condition.direction === "long";
+  if (!long && condition.direction !== "short") throw new Error("a setup is long or short, not " + JSON.stringify(condition.direction));
+  const stop = num(levelOf(condition, "stop")), targets = condition.targets;
+  if (!Array.isArray(targets) || targets.length === 0 || !isDecimal(targets[0])) throw new Error("a setup needs a first target");
+  const target = num(targets[0]);
+  const entryGiven = condition.entry !== undefined && condition.entry !== null;
+  const entryLevel = entryGiven ? num(levelOf(condition, "entry")) : null;
+  const ordered = long
+    ? stop < target && (entryLevel === null || (stop < entryLevel && entryLevel < target))
+    : target < stop && (entryLevel === null || (target < entryLevel && entryLevel < stop));
+  if (!ordered) throw new Error("the setup's levels are not in order for a " + (long ? "long" : "short"));
+  const posted = Date.parse(call.postedAt), deadline = Date.parse(call.deadline);
+  const byMinute = new Map(candles.map(candle => [Date.parse(candle.t), candle]));
+  const candleAt = t => { const c = byMinute.get(t); if (!c) throw new Error("no candle for " + isoOf(t) + ", so nothing has decided the setup yet"); return c; };
+  const hitTarget = c => long ? num(c.h) >= target : num(c.l) <= target;
+  const hitStop = c => long ? num(c.l) <= stop : num(c.h) >= stop;
+  const done = (outcome, t, entry, reason = null) => ({ outcome, decidedAt: isoOf(t), reason, entry });
+  let t = Math.ceil(posted / MINUTE_MS) * MINUTE_MS, entry, last = null;
+  if (entryLevel === null) {
+    if (t + MINUTE_MS > deadline) throw new Error("the setup's deadline leaves no whole minute after the post");
+    entry = candleAt(t).o;
+  } else {
+    let previous = null;
+    for (;; t += MINUTE_MS) {
+      if (t + MINUTE_MS > deadline) return done("void", deadline, condition.entry, "the entry never filled before the deadline");
+      const candle = candleAt(t);
+      const within = num(candle.l) <= entryLevel && entryLevel <= num(candle.h);
+      const jumped = previous !== null && ((num(previous.c) < entryLevel && num(candle.l) > entryLevel) || (num(previous.c) > entryLevel && num(candle.h) < entryLevel));
+      if (within || jumped) break;
+      previous = candle;
+    }
+    entry = condition.entry;
+    const fill = candleAt(t);
+    if (hitTarget(fill) || hitStop(fill)) return done("void", t + MINUTE_MS, entry, "the minute that filled the entry also touched the target or the stop, so their order is unknown");
+    last = fill;
+    t += MINUTE_MS;
+  }
+  for (; t + MINUTE_MS <= deadline; t += MINUTE_MS) {
+    const candle = candleAt(t);
+    const reached = hitTarget(candle), stopped = hitStop(candle);
+    if (reached && stopped) return done("void", t + MINUTE_MS, entry, "one minute touched both the target and the stop");
+    if (reached) return done("true", t + MINUTE_MS, entry);
+    if (stopped) return done("false", t + MINUTE_MS, entry);
+    last = candle;
+  }
+  if (!last) return done("false", deadline, entry);
+  return done((long ? num(last.c) > num(entry) : num(last.c) < num(entry)) ? "true" : "false", deadline, entry);
+}
+function settleCall(rule, call, sources){
+  if (sources.length === 0) throw new Error("a settlement needs at least one source's data");
+  const results = sources.map(({ data }) => rule === "crypto-price@1" ? cryptoPrice1(call, data) : cryptoTrade1(call, data));
+  const first = results[0];
+  if (results.every(r => r.outcome === first.outcome)) return first;
+  const latest = results.reduce((a, b) => Date.parse(b.decidedAt) > Date.parse(a.decidedAt) ? b : a);
+  const voided = { outcome: "void", decidedAt: latest.decidedAt,
+    reason: "the sources disagree: " + sources.map((s, i) => s.source + " says " + results[i].outcome).join(", ") };
+  if (first.entry !== undefined) voided.entry = first.entry;
+  return voided;
+}
+
+// The baselines, as the server's src/settlement/baseline.ts.
+const BASELINE_MODELS = { by: "drift-first-passage@1", at: "drift-terminal@1", setup: "drift-stop-target@1" };
+const DISCRETE_BETA = 0.5826, UNDRIFTED_COINS = ["bitcoin", "ethereum"], BENCHMARK_COIN = "bitcoin", VOLATILITY_CLOSES = 31;
+function erfcx(x){
+  if (x < 0) return 2 * Math.exp(x * x) - erfcx(-x);
+  const t = 1 / (1 + 0.5 * x);
+  const poly = -1.26551223 + t * (1.00002368 + t * (0.37409196 + t * (0.09678418 + t * (-0.18628806 + t * (0.27886807 +
+    t * (-1.13520398 + t * (1.48851587 + t * (-0.82215223 + t * 0.17087277))))))));
+  return t * Math.exp(poly);
+}
+function phi(z){ const half = 0.5 * erfcx(Math.abs(z) / Math.SQRT2) * Math.exp(-z * z / 2); return z < 0 ? half : 1 - half; }
+function sigmaOf(closes){
+  const returns = closes.slice(1).map((point, i) => Math.log(num(point.close) / num(closes[i].close)));
+  const mean = returns.reduce((a, b) => a + b, 0) / returns.length;
+  return Math.sqrt(returns.reduce((a, r) => a + (r - mean) ** 2, 0) / (returns.length - 1));
+}
+function firstPassage(b, mu, sigma, t){
+  if (b <= 0) return 1;
+  const m = mu * t, s = sigma * Math.sqrt(t), z1 = (-b + m) / s, z2 = (-b - m) / s;
+  const second = z2 <= 0 ? 0.5 * erfcx(-z2 / Math.SQRT2) * Math.exp(-((b - m) ** 2) / (2 * s * s)) : Math.exp((2 * mu * b) / (sigma * sigma)) * phi(z2);
+  return phi(z1) + second;
+}
+function stopTarget(a, b, nu, sigma){
+  const k = (2 * nu) / (sigma * sigma);
+  if (k === 0) return b / (a + b);
+  if (k > 0) return Math.expm1(-k * b) / Math.expm1(-k * (a + b));
+  return (Math.exp(k * a) * -Math.expm1(k * b)) / -Math.expm1(k * (a + b));
+}
+const fixed10 = x => String(Number(x.toPrecision(10)));
+const clamp6 = p => Math.min(1, Math.max(0, p)).toFixed(6);
+function closeOn(points, day, what){ const p = points.find(c => c.day === day); if (!p) throw new Error("no " + what + " close for " + day); return p; }
+function volatilityWindow(points, postedAt){
+  const lastDay = dayOf(Date.parse(postedAt) - DAY_MS), end = points.findIndex(p => p.day === lastDay);
+  if (end < VOLATILITY_CLOSES - 1) throw new Error("the volatility series needs the " + VOLATILITY_CLOSES + " closes up to " + lastDay);
+  return points.slice(end - VOLATILITY_CLOSES + 1, end + 1);
+}
+function driftOf(points, postedAt, windowEnd){
+  const startPoint = closeOn(points, dayOf(Date.parse(postedAt) - DAY_MS), "benchmark");
+  const endPoint = closeOn(points, dayOf(Date.parse(windowEnd) - DAY_MS), "benchmark");
+  const days = (closeTime(endPoint) - closeTime(startPoint)) / DAY_MS;
+  return days > 0 ? Math.log(num(endPoint.close) / num(startPoint.close)) / days : 0;
+}
+function baselineFor(rule, call, result, volatility, benchmark){
+  const condition = call.condition, window = volatilityWindow(volatility, call.postedAt), sigma = sigmaOf(window);
+  if (!(sigma > 0)) throw new Error("the volatility series does not move, so there is nothing to model");
+  const undrifted = typeof condition.coin === "string" && UNDRIFTED_COINS.includes(condition.coin);
+  if (!undrifted && !benchmark) throw new Error("a " + String(condition.coin) + " call is drifted, so it needs the benchmark's closes");
+  const drift = undrifted ? 0 : driftOf(benchmark, call.postedAt, rule === "crypto-price@1" ? call.deadline : result.decidedAt);
+  const driftInput = undrifted ? null : fixed10(drift);
+  if (rule === "crypto-trade@1") {
+    const entry = num(result.entry), stop = num(condition.stop), target = num(condition.targets[0]), long = condition.direction === "long";
+    const p = stopTarget(Math.abs(target - entry) / entry, Math.abs(entry - stop) / entry, long ? drift : -drift, sigma);
+    return { model: BASELINE_MODELS.setup, p: clamp6(p), inputs: { start: result.entry, sigma: fixed10(sigma), drift: driftInput, days: null } };
+  }
+  const startPoint = window[window.length - 1], start = num(startPoint.close), level = num(condition.level);
+  const days = (Date.parse(call.deadline) - closeTime(startPoint)) / DAY_MS, above = condition.direction === "above";
+  let p, model;
+  if (condition.by === true) {
+    const shift = Math.exp(DISCRETE_BETA * sigma);
+    const b = above ? Math.log((level * shift) / start) : Math.log(start / (level / shift));
+    p = firstPassage(b, above ? drift : -drift, sigma, days); model = BASELINE_MODELS.by;
+  } else {
+    const z = (Math.log(level / start) - drift * days) / (sigma * Math.sqrt(days));
+    p = above ? 1 - phi(z) : phi(z); model = BASELINE_MODELS.at;
+  }
+  return { model, p: clamp6(p), inputs: { start: startPoint.close, sigma: fixed10(sigma), drift: driftInput, days: fixed10(days) } };
+}
+const RULES_KNOWN = ["crypto-price@1", "crypto-trade@1"];
+const near = (a, b, tolerance) => Math.abs(num(a) - num(b)) <= tolerance * Math.max(1, Math.abs(num(b)));
+
+// The sources each rule reads, as the server's src/settlement/rules.ts. For
+// the outcome, the first always, and each cross-check unless it lacks the
+// data, for one of the reasons leftOutProblem allows; for the baseline, one
+// source's closes of the coin and of the benchmark, or none fixed yet. The
+// checks are the server's src/proof/settlementRecord.ts.
+const RULE_SOURCES = {
+  "crypto-price@1": { outcome: ["coingecko", "binance"], baseline: "coingecko" },
+  "crypto-trade@1": { outcome: ["binance"], baseline: null },
+};
+const SOURCE_NAMES = { coingecko: "CoinGecko", binance: "Binance" };
+const sourceName = source => SOURCE_NAMES[source] || String(source);
+const BINANCE_PUBLISH_WAIT_MS = 2 * DAY_MS;
+const binanceFileOf = (asset, kind, period) => {
+  const width = kind === "minute-candles" ? "1m" : "1d";
+  return "https://data.binance.vision/data/spot/" + (period.length === 10 ? "daily" : "monthly") + "/klines/" + asset + "/" + width + "/" + asset + "-" + width + "-" + period + ".zip";
+};
+const binanceDailyFile = (asset, period) => binanceFileOf(asset, "daily-closes", period);
+const COINGECKO_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+const coingeckoQuery = (coin, fromDay, toDay) => "https://api.coingecko.com/api/v3/coins/" + coin + "/market_chart/range?vs_currency=usd&from=" +
+  (dayStart(fromDay) + DAY_MS) / 1000 + "&to=" + (dayStart(toDay) + DAY_MS) / 1000 + "&interval=daily";
+const binanceTickers = coin => "https://api.coingecko.com/api/v3/coins/" + coin + "/tickers?exchange_ids=binance";
+function sourcesProblem(rule, sources, outcome, leftOut){
+  const left = leftOut.map(entry => entry && entry.source);
+  if (new Set(left).size !== left.length) return "a source is left out twice";
+  for (const source of left) {
+    if (source === sources[0]) return rule + " always reads " + source + ", so it cannot be left out";
+    if (!sources.includes(source)) return rule + " does not read " + source;
+  }
+  const expected = sources.filter(source => !left.includes(source)), held = outcome.map(series => series.source);
+  if (held.join() !== expected.join()) return rule + " reads " + sources.join(" and ") + ": a settlement holds each one's data, in that order, or says why it left one out; this one holds " + (held.join(", ") || "none");
+  return null;
+}
+function baselineSeriesProblem(rule, source, coin, volatility, benchmark){
+  if (source === null) return null;
+  if (volatility && (volatility.source !== source || volatility.asset !== coin)) {
+    return rule + " reads the volatility from " + source + "'s closes of " + String(coin) + ", not " + String(volatility.source) + "'s of " + String(volatility.asset);
+  }
+  if (benchmark && (benchmark.source !== source || benchmark.asset !== BENCHMARK_COIN)) {
+    return rule + " reads the drift from " + source + "'s closes of " + BENCHMARK_COIN + ", not " + String(benchmark.source) + "'s of " + String(benchmark.asset);
+  }
+  return null;
+}
+// The days a CoinGecko range request for a coin asks for, or null if it is not one.
+function coingeckoDays(query, coin){
+  const match = typeof query === "string" ? /&from=(\d{1,12})&to=(\d{1,12})&interval=daily$/.exec(query) : null;
+  if (!match) return null;
+  const from = dayOf(Number(match[1]) * 1000 - DAY_MS), to = dayOf(Number(match[2]) * 1000 - DAY_MS);
+  return from <= to && query === coingeckoQuery(coin, from, to) ? { from, to } : null;
+}
+// Whether a series is the coin's data, held so a reader can check it at its
+// source, as the server's seriesProblem: CoinGecko's inline with the request
+// that gave it, which covers every close held; Binance's as its own files
+// named for the pair.
+function seriesProblem(series, coin){
+  const source = series.source, asset = series.asset;
+  if (source === "binance") {
+    if (typeof asset !== "string" || !/^[A-Z0-9]{1,16}USDT$/.test(asset)) return "a Binance series names a USDT pair, not " + JSON.stringify(asset);
+    if (Array.isArray(series.points) || !Array.isArray(series.files) || series.files.length === 0) return "Binance's " + asset + " data is cited as its own files, never copied in";
+    if (series.query !== null) return "Binance's " + asset + " series is checked by its files' checksums, so it names no request";
+    const minutes = series.kind === "minute-candles", period = minutes ? /-1m-(\d{4}-\d{2}-\d{2})\.zip$/ : /-1d-(\d{4}-\d{2}(?:-\d{2})?)\.zip$/;
+    for (const file of series.files) {
+      const at = (period.exec(String(file && file.url)) || [])[1];
+      if (!at || file.url !== binanceFileOf(asset, minutes ? "minute-candles" : "daily-closes", at)) {
+        return String(file && file.url) + " is not one of Binance's " + (minutes ? "minute" : "daily") + "-candle files for " + asset;
+      }
+    }
+    return null;
+  }
+  if (asset !== coin) return "the " + source + " series is of " + String(asset) + ", not " + coin;
+  if (source !== "coingecko") return series.query === null ? null : "only CoinGecko's requests are checked, so the " + source + " series names none";
+  if (!COINGECKO_ID.test(coin)) return JSON.stringify(coin) + " is not a CoinGecko id";
+  const points = series.points;
+  if (series.kind !== "daily-closes" || !Array.isArray(points) || points.length === 0 || Array.isArray(series.files)) return "CoinGecko's " + coin + " closes are held inline";
+  const first = points[0].day, last = points[points.length - 1].day, asked = coingeckoDays(series.query, coin);
+  if (asked && asked.from <= first && asked.to >= last) return null;
+  return "the request for CoinGecko's " + coin + " closes from " + first + " to " + last + " is CoinGecko's range for " + coin +
+    " over those days or more, such as " + coingeckoQuery(coin, first, last) + ", not " + String(series.query);
+}
+// How far apart two sources' closes run on the days both hold.
+function largestGap(a, b){
+  const byDay = new Map(a.map(p => [p.day, p]));
+  let worst = null, days = 0;
+  for (const p of b) {
+    const q = byDay.get(p.day);
+    if (!q) continue;
+    days++;
+    const gap = Math.abs(num(p.close) / num(q.close) - 1);
+    if (!worst || gap > worst.gap) worst = { day: p.day, gap };
+  }
+  return worst && Object.assign(worst, { days });
+}
+function binanceFilesProblem(closes, from, to){
+  const byDay = new Set(closes.map(point => point.day));
+  for (let start = dayStart(from); start <= dayStart(to); start += DAY_MS) if (!byDay.has(dayOf(start))) return "have no close for " + dayOf(start);
+  try { checkDailyCloses(closes); } catch (e) { return "cannot be read: " + e.message; }
+  return null;
+}
+function leftOutProblem(entry, claim, decidedAt, settledAt, closes){
+  if (entry.source !== "binance") return "no reason is defined for leaving out " + entry.source;
+  const days = entry.days || {}, from = days.from, to = days.to;
+  const postDay = dayOf(Date.parse(claim.postedAt)), lastCounted = dayOf(Date.parse(claim.deadline) - DAY_MS), decidedDay = dayOf(Date.parse(decidedAt) - DAY_MS);
+  if (from !== postDay) return "the days asked for start on " + String(from) + ", not the post's day, " + postDay;
+  if (typeof to !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(to) || to < decidedDay || to > lastCounted) {
+    return "the days asked for end on " + String(to) + ", not a day from " + decidedDay + ", which decided the call, to " + lastCounted + ", the last it reads";
+  }
+  if (to !== lastCounted && Date.parse(settledAt) >= Date.parse(claim.deadline)) return "a settlement at the deadline asks for every day to " + lastCounted;
+  const asked = Date.parse(entry.askedAt);
+  if (!(asked >= dayStart(to) + DAY_MS && asked <= Date.parse(settledAt))) return "it was asked at " + entry.askedAt + ", not between the close of " + to + " and the settlement";
+  if (entry.why === "no-pair") {
+    const coin = String(claim.condition.coin);
+    const listing = COINGECKO_ID.test(coin) ? binanceTickers(coin) : null;
+    if (entry.asset !== null || entry.files !== null || listing === null || entry.url !== listing) return "\"no-pair\" names no pair and no files, and CoinGecko's listing of Binance's markets for " + coin;
+    return null;
+  }
+  if (typeof entry.asset !== "string" || !/^[A-Z0-9]{2,20}$/.test(entry.asset)) return "\"" + entry.why + "\" names the Binance pair";
+  if (entry.why === "no-file") {
+    const day = (/-1d-(\d{4}-\d{2}-\d{2})\.zip$/.exec(entry.url || "") || [])[1];
+    if (entry.files !== null || !day || entry.url !== binanceDailyFile(entry.asset, day)) return "\"no-file\" names one of Binance's daily files for " + entry.asset + ", and no files";
+    if (day < from || day > to) return "the missing file is for " + day + ", not a day asked for";
+    if (asked < dayStart(day) + DAY_MS + BINANCE_PUBLISH_WAIT_MS) return day + "'s file was asked for less than two days after its close";
+    return null;
+  }
+  if (entry.why === "incomplete") {
+    if (entry.url !== null || !Array.isArray(entry.files) || entry.files.length === 0) return "\"incomplete\" cites the files Binance published, and no address";
+    for (const file of entry.files) {
+      const period = (/-1d-(\d{4}-\d{2}(?:-\d{2})?)\.zip$/.exec(String(file && file.url)) || [])[1];
+      if (!period || file.url !== binanceDailyFile(entry.asset, period)) return String(file && file.url) + " is not one of Binance's daily-candle files for " + entry.asset;
+    }
+    if (closes && !binanceFilesProblem(closes, from, to)) return "Binance's files hold a close for every day from " + from + " to " + to + ", so they serve the call";
+    return null;
+  }
+  return JSON.stringify(entry.why) + " is not a reason a source can be left out for";
+}
+// What a reader is told about a source left out, and how to check it.
+function leftOutStep(entry, checked){
+  const name = sourceName(entry.source);
+  if (entry.why === "no-pair") return { ok: null, title: name + " left out: no USDT pair",
+    detail: "when read at " + entry.askedAt + ", CoinGecko's listing of Binance's markets named no USDT pair for this coin: " + entry.url +
+      ". If it names one now, Binance may have listed it since" + fetchAdvice(entry) };
+  if (entry.why === "no-file") return { ok: null, title: name + " left out: a file was missing",
+    detail: entry.url + " was not published when asked at " + entry.askedAt + ", two days or more after its day's close. If it is there now, Binance published it late" + fetchAdvice(entry) };
+  const files = entry.files.map(f => f.url + " (checksum " + f.checksumUrl + ")").join("  ");
+  const fill = ". If Binance has since published a file that fills the gap, give it here with them to see whether Binance would have agreed";
+  return checked
+    ? { ok: true, title: name + " left out: its files have a gap", detail: "Binance's " + entry.asset + " files " + checked + ", so they cannot serve every day from " + entry.days.from + " to " + entry.days.to + fill }
+    : { ok: null, title: name + " left out: its files have a gap", detail: "it says Binance's " + entry.asset + " files lack a close for some day from " + entry.days.from + " to " + entry.days.to +
+        ". Download each and give it here to check: " + files + fill };
+}
+// Which of Binance's files hold the days a left-out source was asked for: a month's once it is out, a day's until then.
+function fetchAdvice(entry){
+  const pair = entry.asset || "PAIR", months = [];
+  for (let start = dayStart(entry.days.from); start <= dayStart(entry.days.to); start += DAY_MS) {
+    const month = dayOf(start).slice(0, 7);
+    if (!months.includes(month)) months.push(month);
+  }
+  return ". To see whether " + sourceName(entry.source) + " would have agreed, give its daily-candle files for " + entry.days.from + " to " + entry.days.to + " here" +
+    (entry.asset ? "" : ", under the coin's USDT pair if Binance trades it") + ": " + months.map(m => binanceDailyFile(pair, m)).join("  ") +
+    ". A month's file appears a few days after the month ends; until then, use each day's, such as " + binanceDailyFile(pair, entry.days.to);
+}
+// The pair and period a Binance file's name gives, allowing for a browser's " (1)".
+function binanceNameOf(name){
+  const match = /([A-Z0-9]{2,20})-1d-(\d{4}-\d{2}(?:-\d{2})?)/.exec(String(name));
+  return match ? { pair: match[1], period: match[2] } : null;
+}
+// Whether a source left out would have changed the settlement, from its own
+// files given by a reader: the files it cites, if any, and the rest given. A
+// settlement before the deadline needed every source to have reached the
+// level by the last day asked for; one at the deadline is the rule run over
+// every source, which is void where they disagree. Only crypto-price@1 has a
+// source that can be left out. The files are not ones the settlement cites,
+// so a reader checks them against Binance's own checksums.
+async function checkLeftOutData(step, rule, call, record, held, entry, cited, files){
+  const name = sourceName(entry.source), own = { kind: "source-file", source: entry.source };
+  const byDay = new Map(cited.map(point => [point.day, point])), used = [];
+  for (const file of files) {
+    const named = binanceNameOf(file.name);
+    if (entry.asset && named && named.pair !== entry.asset) {
+      step(false, "File " + file.name + " is for " + named.pair + ", not " + entry.asset, "the settlement names Binance's " + entry.asset + "; give that pair's files", own);
+      continue;
+    }
+    let points;
+    try { points = await readBinanceFile(file.bytes, "daily-closes"); checkDailyCloses(points); }
+    catch (e) { step(false, "File " + file.name + " cannot be read as Binance's daily candles", e.message, own); continue; }
+    for (const point of points) {
+      const seen = byDay.get(point.day);
+      if (seen && seen.close !== point.close) {
+        step(false, "The files given disagree on " + point.day + "'s close", seen.close + " in one, " + point.close + " in " + file.name, own);
+        return;
+      }
+      byDay.set(point.day, point);
+    }
+    used.push(file);
+  }
+  if (used.length === 0) return;
+  const { from, to } = entry.days, closes = [...byDay.values()].filter(p => p.day >= from && p.day <= to).sort((a, b) => a.day < b.day ? -1 : 1);
+  const pairs = [...new Set(used.map(f => (binanceNameOf(f.name) || {}).pair).filter(Boolean))];
+  const sums = "Check each file against the checksum Binance publishes beside it: " + used.map(f => f.name + " " + f.sha256).join("  ") +
+    (!entry.asset && pairs.length ? ". The files are named for " + pairs.join(" and ") + ": check that is this coin's pair" : "");
+  const gap = binanceFilesProblem(closes, from, to);
+  if (gap) { step(null, "Whether " + name + " would have agreed: not checked", "the files given " + gap + "; give " + name + "'s files for every day from " + from + " to " + to, { kind: "agreement", source: entry.source }); return; }
+  if (rule !== "crypto-price@1" || held.some(o => !o.data)) {
+    step(null, "Whether " + name + " would have agreed: not checked", rule !== "crypto-price@1" ? "only crypto-price@1 has a source that can be left out" : "give the files the settlement cites first", { kind: "agreement", source: entry.source });
+    return;
+  }
+  let agrees, said;
+  try {
+    if (Date.parse(record.settledAt) < Date.parse(call.deadline)) {
+      const run = cryptoPrice1(Object.assign({}, call, { deadline: isoOf(dayStart(to) + DAY_MS) }), closes);
+      agrees = run.outcome === "true";
+      said = agrees ? name + "'s closes had reached the level by " + to + " too, at " + run.decidedAt
+        : name + "'s closes had not reached the level by " + to + ", so the call would have stayed open rather than settle early";
+    } else {
+      const alone = settleCall(rule, call, [{ source: entry.source, data: closes }]);
+      const together = settleCall(rule, call, held.map(o => ({ source: o.source, data: o.data })).concat([{ source: entry.source, data: closes }]));
+      agrees = together.outcome === record.outcome && together.decidedAt === record.decidedAt && together.reason === record.reason;
+      said = rule + " over " + name + "'s closes gives " + alone.outcome + ", decided at " + alone.decidedAt +
+        (agrees ? ", as the settlement's sources do" : ", so with them the settlement would say " + together.outcome + (together.reason ? " (" + together.reason + ")" : "") + ", not " + record.outcome);
+    }
+  } catch (e) { step(null, "Whether " + name + " would have agreed: not checked", e.message, { kind: "agreement", source: entry.source }); return; }
+  if (agrees) step(true, name + " would have agreed", said + ", so leaving it out changed nothing. " + sums, { kind: "agreement", source: entry.source });
+  else step(false, name + " would not have agreed", said + ". " + sums, { kind: "disagrees", source: entry.source });
+}
+
+async function verifySettlement(bundle, opts = {}){
+  const steps = [];
+  for (const s of await verifyBundle(bundle.claim || {}, opts)) steps.push(Object.assign({ section: "claim" }, s));
+  const mine = [];
+  const step = (ok, title, detail, extra) => { mine.push(Object.assign({ ok, title, detail }, extra || {})); return ok; };
+  const finish = () => { for (const s of mine) steps.push(Object.assign({ section: "settlement" }, s)); return steps; };
+  const s = bundle.settlement || {}, record = s.record || {}, claim = (bundle.claim || {}).record || {};
+
+  let leaf;
+  try { leaf = recordLeaf(record); } catch (e) { step(false, "The settlement could not be hashed", e.message); return finish(); }
+  step(true, "Settlement hashed", "leaf " + leaf);
+  if (record.v !== 1 || record.record !== "settlement") { step(false, "This is not a settlement record", "v " + record.v + ", record " + record.record); return finish(); }
+  let claimLeaf = null;
+  try { claimLeaf = recordLeaf(claim); } catch (e) { /* reported below */ }
+  if (!(claimLeaf && record.claimLeaf === claimLeaf && record.claimId === claim.claimId)) {
+    step(false, "The settlement does not name this claim", "it names claim leaf " + record.claimLeaf + "; the claim given hashes to " + claimLeaf);
+    return finish();
+  }
+  step(true, "Settles this claim", "claim leaf " + claimLeaf);
+  // Settlements share their caller's numbered chain, so a correction held
+  // back leaves a gap, as a claim does.
+  const seq = record.callerSeq, prev = record.prevLeaf;
+  const placed = Number.isSafeInteger(seq) && Number.isSafeInteger(claim.callerSeq) && seq > claim.callerSeq &&
+    typeof prev === "string" && /^0x[0-9a-f]{64}$/.test(prev) && (seq !== claim.callerSeq + 1 || prev === claimLeaf);
+  if (!step(placed, placed ? "Record " + seq + " in this caller's chain" : "The settlement has no valid place in its caller's chain", placed
+      ? (seq === claim.callerSeq + 1 ? "straight after its claim, record " + claim.callerSeq : "follows the record with leaf " + prev + ", after its claim, record " + claim.callerSeq) +
+        ". A correction is a later record in the same chain, so one held back leaves a missing number"
+      : "callerSeq " + seq + ", prevLeaf " + prev + "; its claim is record " + claim.callerSeq)) return finish();
+  if (record.replaces) step(null, "This settlement corrects an earlier one", "it replaces " + record.replaces.leaf + ": " + record.replaces.why);
+  const root = rootFromProof(leaf, s.proof || []);
+  if (!step(root === String(s.root).toLowerCase(), "Merkle proof reaches the batch root",
+      root === String(s.root).toLowerCase() ? "root " + root : "proof gives " + root + ", bundle says " + s.root)) return finish();
+
+  // The data: inline points, or the files a reader gave, matched by checksum.
+  const given = new Map(), cited = new Set();
+  const evidence = record.evidence || {};
+  const all = [].concat(evidence.outcome || [], evidence.volatility ? [evidence.volatility] : [], evidence.benchmark ? [evidence.benchmark] : []);
+  for (const series of all) for (const f of series.files || []) cited.add(f.sha256);
+  const leftOut = Array.isArray(evidence.leftOut) ? evidence.leftOut : null;
+  for (const entry of leftOut || []) for (const f of (entry && Array.isArray(entry.files) ? entry.files : [])) cited.add(f.sha256);
+  // A file it does not cite is, where it left a source out, that source's data.
+  const forLeftOut = [];
+  for (const file of Array.isArray(opts.dataFiles) ? opts.dataFiles : []) {
+    const sum = sha256(file.bytes);
+    if (cited.has(sum)) given.set(sum, file);
+    else if (leftOut && leftOut.length > 0) forLeftOut.push(Object.assign({ sha256: sum }, file));
+    else step(false, "Data file " + file.name + " is not one the settlement cites", "its SHA-256 is " + sum, { kind: "data" });
+  }
+  const missing = [];
+  async function dataOf(series){
+    if (Array.isArray(series.points)) return series.points;
+    const parts = [];
+    for (const f of series.files || []) {
+      const file = given.get(f.sha256);
+      if (!file) { missing.push(f); return null; }
+      parts.push(await readBinanceFile(file.bytes, series.kind));
+    }
+    return [].concat(...parts);
+  }
+  let outcomeData, volatility, benchmark;
+  try {
+    outcomeData = [];
+    for (const series of evidence.outcome || []) outcomeData.push({ source: series.source, kind: series.kind, data: await dataOf(series) });
+    volatility = evidence.volatility ? await dataOf(evidence.volatility) : null;
+    benchmark = evidence.benchmark ? await dataOf(evidence.benchmark) : null;
+    for (const o of outcomeData) if (o.data) (o.kind === "minute-candles" ? checkCandles : checkDailyCloses)(o.data);
+    if (volatility) checkDailyCloses(volatility);
+    if (benchmark) checkDailyCloses(benchmark);
+  } catch (e) { step(false, "The settlement's data cannot be read", e.message); return finish(); }
+  if (missing.length > 0) step(null, "Data files not given", "download each from Binance and check it against the checksum Binance publishes beside it: " +
+    missing.map(f => f.url + " (checksum " + f.checksumUrl + ")").join("  "), { kind: "data" });
+
+  const call = { condition: claim.condition || {}, postedAt: claim.postedAt, deadline: claim.deadline };
+  const rule = record.rule;
+  let rerun = null;
+  if (!RULES_KNOWN.includes(rule)) step(null, "Outcome not re-run", "this verifier does not know the rule " + JSON.stringify(rule), { rerun: false });
+  else if ((evidence.outcome || []).length === 0) { step(false, "The settlement has no data for its outcome", "a settlement carries at least one source's data"); return finish(); }
+  else if (outcomeData.some(o => !o.data)) step(null, "Outcome not re-run", "give the data files it cites, listed above, to re-run " + rule, { rerun: false });
+  else {
+    try { rerun = settleCall(rule, call, outcomeData.map(o => ({ source: o.source, data: o.data }))); }
+    catch (e) { step(false, "The settlement's data does not decide the call", e.message); return finish(); }
+    if (rerun.outcome === record.outcome && rerun.decidedAt === record.decidedAt && rerun.reason === record.reason) {
+      step(true, "Outcome re-run: " + record.outcome, rule + " over " + outcomeData.map(o => o.source).join(" and ") + " gives " + rerun.outcome +
+        ", decided at " + rerun.decidedAt + (rerun.reason ? " (" + rerun.reason + ")" : ""));
+    } else {
+      step(false, "The outcome does not follow from the settlement's own data", "the record says " + record.outcome + " at " + record.decidedAt +
+        "; " + rule + " over its data gives " + rerun.outcome + " at " + rerun.decidedAt + (rerun.reason ? " (" + rerun.reason + ")" : ""));
+      return finish();
+    }
+  }
+  // A setup with no entry, null or left out as the rule reads it, opens at a price only its data files hold.
+  const decided = rerun || { outcome: record.outcome, decidedAt: record.decidedAt, reason: record.reason, entry: call.condition.entry ?? undefined };
+  const expectedScores = decided.outcome === "void" ? null : rule === "crypto-price@1" ? call.deadline : decided.decidedAt;
+  if (record.scoresFrom !== expectedScores) { step(false, "The settlement scores from the wrong time", "it says " + record.scoresFrom + "; its rule gives " + expectedScores); return finish(); }
+
+  // Every source the rule reads: its data, or why it was left out.
+  const ruleSources = (opts.ruleSources || RULE_SOURCES)[rule];
+  if (ruleSources) {
+    const problem = leftOut ? sourcesProblem(rule, ruleSources.outcome, evidence.outcome || [], leftOut) : "it does not list the sources it left out";
+    if (problem) { step(false, "The settlement does not account for every source its rule reads", problem); return finish(); }
+    step(true, leftOut.length === 0 ? "Holds data from every source its rule reads" : "Holds data from " + (evidence.outcome || []).map(s => sourceName(s.source)).join(" and ") +
+      "; says why it left out " + leftOut.map(e => sourceName(e.source)).join(" and "), rule + " reads " + ruleSources.outcome.map(sourceName).join(" and "));
+    for (const entry of leftOut) {
+      let closes = null;
+      if (Array.isArray(entry.files) && entry.files.every(f => given.has(f && f.sha256))) {
+        try { closes = [].concat(...await Promise.all(entry.files.map(f => readBinanceFile(given.get(f.sha256).bytes, "daily-closes")))); }
+        catch (e) { step(false, "The files cited for " + sourceName(entry.source) + " cannot be read", e.message); return finish(); }
+      }
+      const why = leftOutProblem(entry, claim, decided.decidedAt, record.settledAt, closes);
+      if (why) { step(false, sourceName(entry.source) + " was left out for a reason that does not hold", why); return finish(); }
+      const shown = leftOutStep(entry, closes && binanceFilesProblem(closes, entry.days.from, entry.days.to));
+      step(shown.ok, shown.title, shown.detail, { kind: "left-out", source: entry.source });
+      if (forLeftOut.length > 0) await checkLeftOutData(step, rule, call, record, outcomeData, entry, closes || [], forLeftOut);
+    }
+    // The baseline's closes are the ones the rule fixes, so none were picked to suit it.
+    const volSeries = evidence.volatility || null, benchSeries = evidence.benchmark || null;
+    const wrong = baselineSeriesProblem(rule, ruleSources.baseline, call.condition.coin, volSeries, benchSeries);
+    if (wrong) { step(false, "The baseline does not read the closes its rule fixes", wrong); return finish(); }
+    if (ruleSources.baseline !== null && (volSeries || benchSeries)) {
+      const from = "from " + sourceName(ruleSources.baseline) + "'s closes of ";
+      step(true, "Baseline reads the closes its rule fixes", rule + " takes " +
+        [volSeries ? "the volatility " + from + call.condition.coin : null, benchSeries ? "the drift " + from + BENCHMARK_COIN : null].filter(Boolean).join(" and "));
+    }
+  }
+
+  // Each series is the coin's, or the benchmark's, and checkable at its source.
+  const coin = String(call.condition.coin);
+  const named = (evidence.outcome || []).map(series => [series, coin, "outcome"]);
+  if (evidence.volatility) named.push([evidence.volatility, coin, "volatility"]);
+  if (evidence.benchmark) named.push([evidence.benchmark, BENCHMARK_COIN, "benchmark"]);
+  for (const [series, of, role] of named) {
+    const wrongSeries = seriesProblem(series, of);
+    if (wrongSeries) { step(false, "The " + sourceName(series.source) + " data for the " + role + " is not what it says it is", wrongSeries); return finish(); }
+  }
+  // Which pair is the coin's is CoinGecko's listing to say, so the reader is
+  // shown where; with both sources' closes at hand, how close they run.
+  (evidence.outcome || []).forEach((series, i) => {
+    if (series.source !== "binance") return;
+    const gecko = outcomeData.find(o => o.source === "coingecko"), mine = outcomeData[i];
+    const worst = gecko && gecko.data && mine && mine.data && mine.kind === "daily-closes" ? largestGap(gecko.data, mine.data) : null;
+    step(null, "Binance's pair: " + series.asset, "the settlement reads Binance's " + series.asset + " market for " + coin +
+      ". CoinGecko's listing of Binance's markets for " + coin + " names its USDT pair: " + binanceTickers(coin) +
+      (worst ? ". On the " + worst.days + " days both hold, Binance's closes are within " + (worst.gap * 100).toFixed(2) + "% of CoinGecko's, furthest apart on " + worst.day : ""),
+      { kind: "pair", source: "binance" });
+  });
+
+  const early = rule === "crypto-price@1" && Date.parse(record.settledAt) < Date.parse(call.deadline);
+  if (decided.outcome === "void" || early) {
+    if (record.baseline !== null) { step(false, "The settlement has a baseline it should not", decided.outcome === "void" ? "a void call is not scored" : "an early hit's baseline waits for the deadline"); return finish(); }
+    step(true, "No baseline yet", decided.outcome === "void" ? "a void call is not scored" : "settled before its deadline: the benchmark's move is known only then, so a settlement at the deadline adds the baseline");
+  } else if (!RULES_KNOWN.includes(rule)) {
+    step(null, "Baseline not re-worked", "this verifier does not know the rule " + JSON.stringify(rule));
+  } else if (!record.baseline) {
+    step(false, "The settlement has no baseline", "a settled call is scored against one"); return finish();
+  } else if (rule === "crypto-trade@1" && decided.entry === undefined) {
+    step(null, "Baseline not re-worked", "the setup opened at the first minute's price, which is in the data files not given", { rerun: false });
+  } else {
+    let again;
+    try { again = baselineFor(rule, call, decided, volatility || [], benchmark); }
+    catch (e) { step(false, "The settlement's baseline cannot be worked out from its data", e.message); return finish(); }
+    const got = record.baseline, inputs = got.inputs || {};
+    const same = got.model === again.model && near(got.p, again.p, 1e-6) && inputs.start === again.inputs.start &&
+      near(inputs.sigma, again.inputs.sigma, 1e-8) && (again.inputs.drift === null ? inputs.drift === null : near(inputs.drift, again.inputs.drift, 1e-8)) &&
+      (again.inputs.days === null ? inputs.days === null : near(inputs.days, again.inputs.days, 1e-8));
+    if (!same) { step(false, "The baseline does not follow from the settlement's own data", "the record says " + got.model + " p " + got.p + "; worked out again, " + again.model + " p " + again.p); return finish(); }
+    step(true, "Baseline re-worked: p " + got.p, again.model + " from a start of " + again.inputs.start + ", daily volatility " + again.inputs.sigma +
+      (again.inputs.drift === null ? ", undrifted" : ", benchmark drift " + again.inputs.drift + " a day") + (again.inputs.days ? " over " + again.inputs.days + " days" : ""));
+  }
+
+  // Every data point it read had happened before the settlement was anchored.
+  let lastData = Date.parse(record.decidedAt);
+  for (const o of outcomeData) if (o.data && o.data.length) {
+    const end = o.data[o.data.length - 1];
+    lastData = Math.max(lastData, o.kind === "minute-candles" ? Date.parse(end.t) + MINUTE_MS : closeTime(end));
+  }
+  const anchors = s.anchors || [];
+  if (anchors.length === 0) { step(false, "No anchor to check", "this settlement has not been anchored yet"); return finish(); }
+  await checkAnchors(mine, anchors, root, s.cid, opts, i => "s" + i, (when, tx, step) => {
+    if (when.getTime() < lastData) step(false, "Anchored before the data it cites", "anchored at " + when.toISOString() + ", but its data runs to " + isoOf(lastData));
+    else step(true, "Settlement anchored at " + when.toISOString(), "block " + parseInt(tx.blockNumber, 16) + "; its data runs to " + isoOf(lastData));
+  });
+  return finish();
+}
+
+// A settlement verifies only if both the claim and the settlement have an
+// anchor that passes, its outcome and baseline were worked out again, and
+// nothing failed. A reader's own copy failing (text, a photo, a data file)
+// says that copy is wrong, not the settlement. Nor does a left-out source's
+// data that would have changed it make it fail: its reason may be true, and
+// the data out only since. The verdict says so instead.
+function summariseSettlement(steps){
+  const own = ["text", "image", "data", "source-file"];
+  if (steps.some(s => s.ok === false && !own.includes(s.kind) && s.kind !== "disagrees")) return { verdict: "failed", message: "This settlement did not verify." };
+  const groups = {};
+  for (const s of steps) if (s.check) (groups[String(s.anchor)] = groups[String(s.anchor)] || {})[s.check] = s.ok;
+  const passes = which => Object.keys(groups).some(k => (k[0] === "s") === (which === "settlement") &&
+    groups[k].root === true && groups[k].cid === true && groups[k].sender === true);
+  if (!passes("claim") || !passes("settlement")) {
+    return Object.values(groups).some(g => g.sender === null)
+      ? { verdict: "sender-unchecked", message: "Not verified: an anchor's sender is not a published Receipts key, so this does not show that Receipts anchored it." }
+      : { verdict: "unchecked", message: "Not verified: no anchor could be checked for the " + (passes("claim") ? "settlement" : "claim") + "." };
+  }
+  if (steps.some(s => s.rerun === false)) return { verdict: "data-unchecked", message: "The settlement is anchored and unchanged, but its outcome or baseline was not worked out again: give it the data files it cites." };
+  const namesOf = kind => [...new Set(steps.filter(s => s.kind === kind).map(s => sourceName(s.source)))];
+  const disagree = namesOf("disagrees");
+  if (disagree.length) {
+    return { verdict: "left-out-disagrees", message: "The settlement checks out on its own data, but " + disagree.join(" and ") + "'s files given here, which it left out, would have changed it. " +
+      "If they were out when it was settled, its reason for leaving " + disagree.join(" and ") + " out was wrong, and the settlement should be corrected." };
+  }
+  for (const kind of own) if (steps.some(s => s.ok === false && s.kind === kind)) {
+    if (kind === "source-file") return { verdict: "source-file-mismatch", message: "The settlement checks out, but a file given for a source it left out could not be used." };
+    return { verdict: kind + "-mismatch", message: "The settlement checks out, but that " + (kind === "data" ? "data file" : kind === "image" ? "photo" : "text") + " is not what it committed to." };
+  }
+  const left = namesOf("left-out"), agreed = steps.filter(s => s.kind === "agreement" && s.ok === true).map(s => sourceName(s.source));
+  const checked = left.length > 0 && left.every(name => agreed.includes(name));
+  return { verdict: "verified", message: "This settlement verifies: its outcome and baseline follow from its own data." +
+    (checked ? " It holds no data from " + left.join(" or ") + ", but " + left.join(" and ") + "'s files given here agree with it."
+      : left.length ? " It holds no data from " + left.join(" or ") + ": the reason it gives is listed, with where to check it." : "") };
+}
+
+/* ---------- scores: the same method as the server's src/scoring/score.ts ---------- */
+// A caller's edge is the average of what happened less what the baseline
+// said, over the calls that count, with a 95% range from a bootstrap over the
+// weeks they count in. The seed is the hash of the settlements read, the
+// generator and its draws are fixed, and every sum is whole millionths, so
+// anyone with the same records gets the same figures.
+
+const SCORE_METHOD = "cluster-bootstrap@1", RESAMPLES = 10000, LOW_RANK = 250, HIGH_RANK = RESAMPLES - LOW_RANK - 1;
+const MIN_CLUSTERS = 5, PROVISIONAL_BELOW = 20, FORM_CALLS = 30, MILLION = 1000000;
+const TOPIC_FOR_KIND = { "crypto-price": "crypto", "crypto-trade": "crypto" };
+const hashCanonical = value => keccak256(utf8(canonicalJson(value)));
+// xoshiro128** (Blackman and Vigna), from the first 16 bytes of the seed as four big-endian words.
+function xoshiro128ss(seed){
+  const word = i => parseInt(seed.slice(2 + 8 * i, 10 + 8 * i), 16) | 0;
+  let a = word(0), b = word(1), c = word(2), d = word(3);
+  const rotl = (x, k) => (x << k) | (x >>> (32 - k));
+  return () => {
+    const result = Math.imul(rotl(Math.imul(b, 5), 7), 9) >>> 0;
+    const t = b << 9;
+    c ^= a; d ^= b; b ^= c; a ^= d; c ^= t; d = rotl(d, 11);
+    return result;
+  };
+}
+function below(next, k){
+  const limit = 2 ** 32 - (2 ** 32 % k);
+  for (;;) { const r = next(); if (r < limit) return r % k; }
+}
+function weekOf(ms){
+  const day = Math.floor(ms / DAY_MS);
+  return new Date((day - (((day + 3) % 7) + 7) % 7) * DAY_MS).toISOString().slice(0, 10);
+}
+function percent(sum, count, signed){
+  const num = BigInt(sum), den = BigInt(count) * 1000n;
+  const tenths = ((num < 0n ? -num : num) * 2n + den) / (2n * den);
+  const text = (tenths / 10n) + "." + (tenths % 10n);
+  return !signed || tenths === 0n ? text : (num < 0n ? "-" : "+") + text;
+}
+function millionths(p){
+  if (typeof p !== "string" || !/^(?:0\.\d{6}|1\.000000)$/.test(p)) throw new Error("a baseline probability has six decimals from 0 to 1, not " + JSON.stringify(p));
+  return Number(p[0]) * MILLION + Number(p.slice(2));
+}
+function byValue(sums, counts){
+  return (i, j) => {
+    const a = sums[i] / counts[i], b = sums[j] / counts[j];
+    if (a !== b) return a < b ? -1 : 1;
+    const exact = BigInt(sums[i]) * BigInt(counts[j]) - BigInt(sums[j]) * BigInt(counts[i]);
+    return exact < 0n ? -1 : exact > 0n ? 1 : i - j;
+  };
+}
+function estimate(calls){
+  const hits = calls.filter(call => call.hit > 0).length;
+  if (calls.length === 0) return { calls: 0, hits: 0, clusters: 0, seed: null, edge: null, hitRate: null, baseline: null };
+  const weeks = new Map();
+  for (const call of calls) {
+    const cluster = weeks.get(call.week) || { calls: 0, hit: 0, p: 0 };
+    cluster.calls += 1; cluster.hit += call.hit; cluster.p += call.p;
+    weeks.set(call.week, cluster);
+  }
+  const clusters = [...weeks.keys()].sort().map(week => weeks.get(week));
+  const seed = hashCanonical({ method: SCORE_METHOD, leaves: calls.map(call => call.leaf).sort() });
+  const base = { calls: calls.length, hits, clusters: clusters.length, seed };
+  if (clusters.length < MIN_CLUSTERS) return Object.assign(base, { edge: null, hitRate: null, baseline: null });
+  const next = xoshiro128ss(seed), k = clusters.length;
+  const counts = [], hitSums = [], pSums = [];
+  for (let r = 0; r < RESAMPLES; r++) {
+    let count = 0, hit = 0, p = 0;
+    for (let j = 0; j < k; j++) { const cluster = clusters[below(next, k)]; count += cluster.calls; hit += cluster.hit; p += cluster.p; }
+    counts.push(count); hitSums.push(hit); pSums.push(p);
+  }
+  const totalHit = hits * MILLION, totalP = calls.reduce((sum, call) => sum + call.p, 0);
+  const figure = (sums, value, signed) => {
+    const order = Array.from({ length: RESAMPLES }, (_, i) => i).sort(byValue(sums, counts));
+    const low = order[LOW_RANK], high = order[HIGH_RANK];
+    return { value: percent(value, calls.length, signed), low: percent(sums[low], counts[low], signed), high: percent(sums[high], counts[high], signed) };
+  };
+  return Object.assign(base, {
+    edge: figure(hitSums.map((hit, r) => hit - pSums[r]), totalHit - totalP, true),
+    hitRate: figure(hitSums, totalHit, false),
+    baseline: figure(pSums, totalP, false),
+  });
+}
+function scoreCaller(records, asOf){
+  if (!Array.isArray(records) || records.length === 0) throw new Error("a score needs the caller's records");
+  const asOfDate = new Date(asOf);
+  if (Number.isNaN(asOfDate.getTime())) throw new Error("not a valid timestamp: " + String(asOf));
+  const at = asOfDate.toISOString(), now = Date.parse(at);
+  const bySeq = new Map();
+  for (const record of records) {
+    const seq = record.callerSeq;
+    if (!Number.isSafeInteger(seq) || seq < 1) throw new Error("a caller's records are numbered from 1, not " + String(seq));
+    if (bySeq.has(seq)) throw new Error("two records are numbered " + seq);
+    bySeq.set(seq, record);
+  }
+  const seqs = [...bySeq.keys()].sort((a, b) => a - b);
+  const highest = seqs[seqs.length - 1], gaps = [];
+  for (let seq = 1; seq <= highest; seq++) if (!bySeq.has(seq)) gaps.push(seq);
+  let callerId = null, checkpoint = null;
+  const leaves = new Map(), claims = new Map(), calls = [];
+  for (const seq of seqs) {
+    const record = bySeq.get(seq);
+    const kind = "record" in record ? String(record.record) : "claim";
+    const leaf = hashCanonical(record);
+    leaves.set(seq, leaf);
+    if (seq === 1 && kind !== "claim") throw new Error("a caller's chain starts with a claim");
+    const before = seq === 1 ? null : leaves.get(seq - 1);
+    if (before !== undefined && record.prevLeaf !== before) throw new Error("record " + seq + " does not name record " + (seq - 1) + " as the one before it");
+    if (kind === "claim") {
+      callerId ??= record.callerId;
+      if (record.callerId !== callerId) throw new Error("the records are of more than one caller: " + callerId + " and " + record.callerId);
+      if (claims.has(record.claimId)) throw new Error("claim " + record.claimId + " is given twice");
+      const topic = TOPIC_FOR_KIND[String(record.condition.kind)] ?? null;
+      const line = { callerSeq: seq, claimId: record.claimId, topic, status: "open", settlement: null, outcome: null, scoresFrom: null, week: null, edge: null };
+      calls.push(line);
+      claims.set(record.claimId, { claim: record, line, latest: null, latestSeq: seq, latestLeaf: null });
+    } else if (kind === "settlement") {
+      const entry = claims.get(record.claimId);
+      if (!entry || record.claimLeaf !== recordLeaf(entry.claim)) throw new Error("record " + seq + " settles a claim that is not before it in the records");
+      if (!entry.line.topic) throw new Error("record " + seq + " is a settlement, but no rule settles a " + String(entry.claim.condition.kind) + " call");
+      if (((record.replaces && record.replaces.leaf) ?? null) !== entry.latestLeaf) throw new Error("record " + seq + " does not replace its claim's previous settlement in the chain");
+      if (!(Date.parse(record.settledAt) <= now)) throw new Error("record " + seq + ", a settlement, is from after " + at);
+      Object.assign(entry, { latest: record, latestSeq: seq, latestLeaf: leaf });
+    } else if (kind === "checkpoint") {
+      const made = String(record.at);
+      if (!(Date.parse(made) <= now)) throw new Error("record " + seq + ", a checkpoint, is from after " + at);
+      checkpoint = { callerSeq: seq, at: made };
+    } else throw new Error("record " + seq + " is not a claim, a settlement or a checkpoint");
+  }
+  if (callerId === null) throw new Error("a score needs at least one of the caller's claims");
+  const counted = new Map();
+  for (const { claim, line, latest: settlement, latestSeq: seq, latestLeaf } of claims.values()) {
+    const topic = line.topic;
+    if (topic && !counted.has(topic)) counted.set(topic, []);
+    if (!settlement) {
+      if (!topic) line.status = "no-rule";
+      else if (now >= Date.parse(claim.deadline)) line.status = "unsettled";
+      continue;
+    }
+    line.settlement = latestLeaf;
+    line.outcome = settlement.outcome;
+    if (settlement.outcome === "void") { line.status = "void"; continue; }
+    if (settlement.outcome !== "true" && settlement.outcome !== "false") throw new Error("record " + seq + ", a settlement, has no outcome a score can read");
+    const from = Date.parse(String(settlement.scoresFrom));
+    if (Number.isNaN(from)) throw new Error("record " + seq + ", a settlement, does not say when it counts from");
+    line.scoresFrom = settlement.scoresFrom;
+    if (settlement.baseline === null) {
+      if (settlement.outcome !== "true") throw new Error("record " + seq + " is settled before its baseline, which only a hit is");
+      line.status = "pending"; continue;
+    }
+    if (from > now) { line.status = "pending"; continue; }
+    const p = millionths(settlement.baseline.p), hit = settlement.outcome === "true" ? MILLION : 0;
+    line.status = "scored";
+    line.week = weekOf(from);
+    line.edge = percent(hit - p, 1, true);
+    counted.get(topic).push({ leaf: latestLeaf, seq: line.callerSeq, at: from, week: line.week, hit, p });
+  }
+  const topics = [...counted.keys()].sort().map(topic => {
+    const scored = counted.get(topic);
+    const latest = [...scored].sort((a, b) => a.at - b.at || a.seq - b.seq).slice(-FORM_CALLS);
+    return { topic, scored: scored.length, provisional: scored.length < PROVISIONAL_BELOW, record: estimate(scored), form: estimate(latest) };
+  });
+  return { method: SCORE_METHOD, callerId, asOf: at, chain: { highest, gaps, checkpoint }, calls, topics };
+}
+
+/* ---------- checkpoints: the end of a caller's chain ---------- */
+// Once a day Receipts adds a checkpoint to every caller's chain. Each record
+// names the one before it, so a reader holding a caller's records up to the
+// newest checkpoint knows none between them was held back. A checkpoint's age
+// is its anchor's block time, never the time it states, and after two days
+// records made since may be missing from what the reader holds.
+
+const CHECKPOINT_STALE_MS = 2 * DAY_MS;
+// Block times are whole seconds, and our clock and the chain's can differ, so
+// a checkpoint's own date may run a little past its anchor's.
+const CHECKPOINT_CLOCK_MS = 10 * 60000;
+const ageOf = ms => ms < 2 * 3600000 ? Math.round(ms / 60000) + " minutes" : ms < 2 * DAY_MS ? (ms / 3600000).toFixed(1) + " hours" : (ms / DAY_MS).toFixed(1) + " days";
+async function verifyCheckpoint(bundle, opts = {}){
+  const steps = [];
+  const step = (ok, title, detail, extra) => { steps.push(Object.assign({ ok, title, detail }, extra || {})); return ok; };
+  const c = (bundle && bundle.checkpoint) || {}, record = c.record || {};
+  let leaf;
+  try { leaf = recordLeaf(record); } catch (e) { step(false, "The checkpoint could not be hashed", e.message); return steps; }
+  step(true, "Checkpoint hashed", "leaf " + leaf);
+  if (record.v !== 1 || record.record !== "checkpoint") { step(false, "This is not a checkpoint record", "v " + record.v + ", record " + record.record); return steps; }
+  const placed = Number.isSafeInteger(record.callerSeq) && record.callerSeq >= 2 && typeof record.prevLeaf === "string" && /^0x[0-9a-f]{64}$/.test(record.prevLeaf);
+  if (!placed) { step(false, "The checkpoint has no valid place in its caller's chain", "callerSeq " + record.callerSeq + ", prevLeaf " + record.prevLeaf); return steps; }
+  step(true, "Record " + record.callerSeq + " in this caller's chain, a checkpoint", "follows the record with leaf " + record.prevLeaf +
+    ". Given every record from 1 to " + record.callerSeq + " with no number missing, none of them was held back");
+  const root = rootFromProof(leaf, c.proof || []);
+  if (!step(root === String(c.root).toLowerCase(), "Merkle proof reaches the batch root",
+      root === String(c.root).toLowerCase() ? "root " + root : "proof gives " + root + ", bundle says " + c.root)) return steps;
+  const anchors = c.anchors || [];
+  if (anchors.length === 0) { step(false, "No anchor to check", "this checkpoint has not been anchored yet"); return steps; }
+  const now = opts.now ? new Date(opts.now).getTime() : Date.now();
+  let first = null;
+  await checkAnchors(steps, anchors, root, c.cid, opts, i => i, (when, tx, step) => {
+    if (!(Date.parse(record.at) <= when.getTime() + CHECKPOINT_CLOCK_MS)) step(false, "The checkpoint is dated after its anchor", "it says " + record.at + ", but it was anchored at " + when.toISOString());
+    else step(true, "Checkpoint anchored at " + when.toISOString(), "block " + parseInt(tx.blockNumber, 16) + "; Receipts dated it " + record.at);
+    if (first === null || when.getTime() < first) first = when.getTime();
+  });
+  if (first !== null) {
+    const age = now - first;
+    if (age > CHECKPOINT_STALE_MS) step(null, "This checkpoint is " + ageOf(age) + " old", "Receipts adds one to each chain every day, so records made since may be missing. " +
+      "Ask for the caller's newest checkpoint", { kind: "stale" });
+    else step(true, "Anchored " + ageOf(Math.max(age, 0)) + " ago, by your clock", "Receipts adds a checkpoint to each chain every day, so anything held back after it would show within a day");
+  }
+  return steps;
+}
+function summariseCheckpoint(steps){
+  const verdict = summarise(steps);
+  if (verdict.verdict !== "verified") return verdict.verdict === "failed" ? { verdict: "failed", message: "This checkpoint did not verify." } : verdict;
+  if (steps.some(s => s.kind === "stale")) return { verdict: "stale", message: "This checkpoint verifies, but it is more than two days old, so records made since may be missing." };
+  return { verdict: "verified", message: "This checkpoint verifies: given every record up to it, none of them was held back." };
+}
+
+/* ---------- a caller's export: the whole chain, and the score worked out from it ---------- */
+// A score is an average over many records, so one receipt at a time cannot
+// check it: a range only Receipts can compute is Receipts' word. An export
+// holds every place in a caller's chain, each record with its own proof and
+// anchors, and the score Receipts publishes. This follows the chain from 1,
+// checks each record against what was anchored, works out each baseline the
+// score rests on again, and then works the score out again and compares it
+// figure for figure.
+
+const kindOf = record => ("record" in record ? String(record.record) : "claim");
+const figureText = figure => (figure && typeof figure === "object"
+  ? figure.value + " (" + figure.low + " to " + figure.high + ")" : "no figure");
+
+// Says where a score Receipts states differs from the one its own records
+// give, in a reader's terms rather than as two blobs of JSON.
+function scoreDifference(mine, stated){
+  const same = (a, b) => canonicalJson(a === undefined ? null : a) === canonicalJson(b === undefined ? null : b);
+  if (!stated || typeof stated !== "object" || Array.isArray(stated)) return "the export states no score";
+  // A field the method does not produce would be a figure nothing here checks.
+  const extra = Object.keys(stated).find(key => !Object.keys(mine).includes(key));
+  if (extra) return "it states " + JSON.stringify(extra) + ", which " + mine.method + " does not give";
+  for (const key of ["method", "callerId", "asOf"]) if (!same(mine[key], stated[key]))
+    return key + ": it states " + JSON.stringify(stated[key] === undefined ? null : stated[key]) + ", the records give " + JSON.stringify(mine[key]);
+  if (!same(mine.chain, stated.chain)) {
+    const theirs = stated.chain && typeof stated.chain === "object" ? stated.chain : {};
+    if (!same(mine.chain.highest, theirs.highest)) return "the highest number: it states " + JSON.stringify(theirs.highest === undefined ? null : theirs.highest) + ", the records give " + mine.chain.highest;
+    if (!same(mine.chain.gaps, theirs.gaps)) return "the missing numbers: it states " + JSON.stringify(theirs.gaps === undefined ? null : theirs.gaps) + ", the records give " + JSON.stringify(mine.chain.gaps);
+    return "the newest checkpoint: it states " + canonicalJson(theirs.checkpoint === undefined ? null : theirs.checkpoint) + ", the records give " + canonicalJson(mine.chain.checkpoint);
+  }
+  if (!same(mine.calls, stated.calls)) {
+    const theirs = Array.isArray(stated.calls) ? stated.calls : [];
+    for (const call of mine.calls) {
+      const said = theirs.find(c => c && c.claimId === call.claimId);
+      if (!said) return "it lists no call for claim " + call.claimId;
+      if (said.status !== call.status) return "claim " + call.claimId + ": it states " + JSON.stringify(said.status) + ", the records give " + JSON.stringify(call.status);
+      if (!same(call.edge, said.edge)) return "claim " + call.claimId + "'s edge: it states " + JSON.stringify(said.edge === undefined ? null : said.edge) + ", the records give " + JSON.stringify(call.edge);
+      if (!same(call, said)) return "claim " + call.claimId + ": it states " + canonicalJson(said) + ", the records give " + canonicalJson(call);
+    }
+    return "it lists " + theirs.length + " calls, the records give " + mine.calls.length;
+  }
+  const theirTopics = Array.isArray(stated.topics) ? stated.topics : [];
+  for (const topic of mine.topics) {
+    const said = theirTopics.find(t => t && t.topic === topic.topic);
+    if (!said) return "it states no " + topic.topic + " record";
+    for (const part of ["record", "form"]) for (const figure of ["edge", "hitRate", "baseline"]) {
+      const ours = topic[part][figure], theirs = (said[part] && typeof said[part] === "object" ? said[part] : {})[figure];
+      if (!same(ours, theirs)) return topic.topic + " " + (part === "form" ? "form " : "") + figure + ": it states " +
+        figureText(theirs) + ", the records give " + figureText(ours);
+    }
+    if (!same(topic, said)) return "the " + topic.topic + " counts: it states " + said.scored + " scored calls, the records give " + topic.scored;
+  }
+  if (theirTopics.length !== mine.topics.length) return "it states " + theirTopics.length + " topics, the records give " + mine.topics.length;
+  return null;
+}
+
+// Why the export says a record isn't shown, in words, or null if it says
+// nothing. Only ever shown as Receipts' statement: nothing here checks it.
+const WITHHELD_WORDS = {
+  "hold": "in its hold",
+  "no-archive": "no archived copy of its post could be read",
+  "withdrawn": "withdrawn as an extraction error",
+  "erased": "erased on request",
+};
+function withheldWhy(withheld, seq){
+  if (withheld === undefined || withheld === null) return null;
+  if (typeof withheld !== "object") return "a reason this verifier can't read: " + JSON.stringify(withheld);
+  if ("follows" in withheld) {
+    return Number.isSafeInteger(withheld.follows) && withheld.follows > 0 && withheld.follows < seq
+      ? "because record " + withheld.follows + ", which it follows, isn't shown"
+      : "a reason this verifier can't read: " + JSON.stringify(withheld);
+  }
+  const words = Object.prototype.hasOwnProperty.call(WITHHELD_WORDS, withheld.reason) ? WITHHELD_WORDS[withheld.reason] : null;
+  if (words === null) return "a reason this verifier doesn't know: " + JSON.stringify(withheld.reason);
+  // A hold or a missing archive lasts a while; a withdrawal or an erasure happened once.
+  const lasting = withheld.reason === "hold" || withheld.reason === "no-archive";
+  const since = typeof withheld.since === "string" ? (lasting ? " since " : " on ") + withheld.since : "";
+  const until = typeof withheld.until === "string" ? ", until " + withheld.until : "";
+  return words + since + until;
+}
+
+async function verifyExport(bundle, opts = {}){
+  const steps = [];
+  const step = (ok, title, detail, extra) => { steps.push(Object.assign({ ok, title, detail }, extra || {})); return ok; };
+  if (bundle.v !== 1 || bundle.export !== "caller") { step(false, "This is not a caller's export", "v " + bundle.v + ", export " + bundle.export); return steps; }
+  const entries = Array.isArray(bundle.records) ? bundle.records : [];
+  if (entries.length === 0) { step(false, "The export holds no records", "an export carries every place in the caller's chain"); return steps; }
+
+  /* ----- one chain, numbered from 1, each record naming the one before it ----- */
+  const bySeq = new Map();
+  for (const entry of entries) {
+    const seq = entry && entry.callerSeq;
+    if (!Number.isSafeInteger(seq) || seq < 1) { step(false, "A place in the chain is not numbered", "callerSeq " + JSON.stringify(entry && entry.callerSeq)); return steps; }
+    if (bySeq.has(seq)) { step(false, "Two places in the chain are numbered " + seq, "a chain numbers each record once"); return steps; }
+    bySeq.set(seq, entry);
+  }
+  const seqs = [...bySeq.keys()].sort((a, b) => a - b);
+  const highest = seqs[seqs.length - 1];
+  const skipped = [];
+  for (let seq = 1; seq <= highest; seq++) if (!bySeq.has(seq)) skipped.push(seq);
+  if (skipped.length) {
+    step(false, "The export is not a whole chain", "it gives no place at all for record " + skipped.join(", ") +
+      ", so a reader cannot tell what is missing from the score");
+    return steps;
+  }
+
+  const leaves = new Map(), withheld = [], records = [];
+  for (const seq of seqs) {
+    const record = bySeq.get(seq).record;
+    if (!record || typeof record !== "object") { withheld.push(seq); continue; }
+    let leaf;
+    try { leaf = recordLeaf(record); } catch (e) { step(false, "Record " + seq + " could not be hashed", e.message); return steps; }
+    if (record.callerSeq !== seq) { step(false, "Record " + seq + " is numbered " + JSON.stringify(record.callerSeq) + " in its own text",
+      "a record's place is part of what was hashed, so the export cannot renumber it"); return steps; }
+    leaves.set(seq, leaf);
+    records.push(record);
+  }
+  let callerId = null, unlinked = null;
+  for (const seq of seqs) {
+    const record = bySeq.get(seq).record;
+    if (!leaves.has(seq)) continue;
+    const kind = kindOf(record);
+    if (!["claim", "settlement", "checkpoint"].includes(kind)) { step(false, "Record " + seq + " is not a claim, a settlement or a checkpoint", "it says record " + JSON.stringify(record.record)); return steps; }
+    if (kind !== bySeq.get(seq).kind) { step(false, "Record " + seq + " is not the kind the export calls it", "the export says " + JSON.stringify(bySeq.get(seq).kind) + ", the record says " + kind); return steps; }
+    if (seq === 1 && kind !== "claim") { step(false, "The chain does not start with a claim", "record 1 is a " + kind); return steps; }
+    if (kind === "claim") {
+      if (callerId === null) callerId = record.callerId;
+      else if (record.callerId !== callerId) { step(false, "The records are of more than one caller", callerId + " and " + record.callerId); return steps; }
+    }
+    const want = seq === 1 ? null : leaves.has(seq - 1) ? leaves.get(seq - 1) : undefined;
+    if (want === undefined) { unlinked = seq; continue; }
+    if (record.prevLeaf !== want) {
+      step(false, "Record " + seq + " does not name record " + (seq - 1) + " as the one before it",
+        "it names " + JSON.stringify(record.prevLeaf) + "; record " + (seq - 1) + " hashes to " + want);
+      return steps;
+    }
+  }
+  if (callerId === null) { step(false, "The export holds none of the caller's claims", "a score is worked out from claims and their settlements"); return steps; }
+  if (callerId !== bundle.callerId) { step(false, "The records are not the caller the export names", "it names " + JSON.stringify(bundle.callerId) + ", the records are of " + callerId); return steps; }
+  step(true, "One chain, records 1 to " + highest + ", of " + callerId,
+    "every number is accounted for, and each record names the record before it by its hash" +
+    (unlinked === null ? "" : ", except record " + unlinked + ", whose predecessor is not shown"));
+  if (withheld.length) {
+    const said = withheld.map(seq => [seq, withheldWhy(bySeq.get(seq).withheld, seq)]).filter(([, why]) => why !== null);
+    step(null, "Records not shown: " + withheld.join(", "),
+      "Receipts holds a record at each of these numbers and is not showing it here, so calls may be missing from this score" +
+      (said.length === 0 ? ". It gives no reason for any of them"
+        : ". The gaps are checked above; the reasons are Receipts' own word, which this page can't check: " +
+          said.map(([seq, why]) => seq + ", " + why).join("; ") +
+          (said.length < withheld.length ? "; no reason given for the rest" : "")),
+      { kind: "withheld" });
+  }
+
+  /* ----- each record's proof, and each batch's anchor read once ----- */
+  const roots = new Map(), unbatched = [];
+  for (const seq of seqs) {
+    const entry = bySeq.get(seq), leaf = leaves.get(seq);
+    if (!leaf) continue;
+    if (!entry.root) { unbatched.push(seq); continue; }
+    const root = String(entry.root).toLowerCase();
+    const got = rootFromProof(leaf, Array.isArray(entry.proof) ? entry.proof : []);
+    if (got !== root) { step(false, "Record " + seq + "'s Merkle proof does not reach its batch root", "its proof gives " + got + ", the export says " + root); return steps; }
+    const group = roots.get(root) || { cid: entry.cid, anchors: Array.isArray(entry.anchors) ? entry.anchors : [], seqs: [], at: null, ok: false };
+    if (group.cid !== entry.cid) { step(false, "Records " + group.seqs.join(", ") + " and " + seq + " share a batch root under different batch files", group.cid + " and " + entry.cid); return steps; }
+    group.seqs.push(seq);
+    roots.set(root, group);
+  }
+  if (roots.size === 0) { step(false, "None of these records is in a batch", "nothing here has been anchored, so there is nothing to check against the chain"); return steps; }
+  step(true, "Every batched record's Merkle proof reaches its batch root", roots.size === 1
+    ? "records " + [...roots.values()][0].seqs.join(", ") + " in one batch"
+    : [...roots.values()].map(g => "records " + g.seqs.join(", ")).join("; ") + ": " + roots.size + " batches");
+
+  const rootList = [...roots.keys()];
+  for (let r = 0; r < rootList.length; r++) {
+    const group = roots.get(rootList[r]);
+    const list = "Record" + (group.seqs.length === 1 ? " " : "s ") + group.seqs.join(", ");
+    if (group.anchors.length === 0) { step(false, list + ": no anchor to check", "batch file " + group.cid + " has not been anchored yet"); continue; }
+    const before = steps.length;
+    await checkAnchors(steps, group.anchors, rootList[r], group.cid, opts, i => r + ":" + i, (when, tx, anchorStep) => {
+      anchorStep(true, list + " anchored at " + when.toISOString(), "block " + parseInt(tx.blockNumber, 16) + ", batch file " + group.cid);
+      if (group.at === null || when.getTime() < group.at) group.at = when.getTime();
+    });
+    const checks = {};
+    for (const s of steps.slice(before)) if (s.check) (checks[s.anchor] = checks[s.anchor] || {})[s.check] = s.ok;
+    const passes = Object.values(checks);
+    group.ok = passes.some(a => a.root === true && a.cid === true && a.sender === true);
+    if (!group.ok) step(passes.some(a => a.sender === null) ? null : false, list + ": not shown to be anchored by Receipts",
+      passes.some(a => a.sender === null)
+        ? "an anchor holds this batch, but its sender is not a key published in this verifier, so it does not show that Receipts anchored it"
+        : "no anchor of batch file " + group.cid + " could be checked",
+      { kind: passes.some(a => a.sender === null) ? "sender-unchecked" : "unanchored-batch" });
+  }
+
+  // A record in no batch of its own is still committed to by any later record
+  // in the chain that is anchored, since each record names the one before it.
+  // A record Receipts is not showing breaks that, so nothing below it is bound
+  // to anything above it.
+  const coveredBy = new Map();
+  let cover = null;
+  for (let i = seqs.length - 1; i >= 0; i--) {
+    const seq = seqs[i], entry = bySeq.get(seq);
+    if (!leaves.has(seq)) { cover = null; continue; }
+    const group = entry.root ? roots.get(String(entry.root).toLowerCase()) : null;
+    if (group && group.ok) cover = { seq: seq, at: group.at };
+    else if (cover) coveredBy.set(seq, cover);
+  }
+  const held = unbatched.filter(seq => leaves.has(seq));
+  const covered = held.filter(seq => coveredBy.has(seq));
+  const loose = held.filter(seq => !coveredBy.has(seq));
+  if (covered.length) step(true, "Record" + (covered.length === 1 ? " " : "s ") + covered.join(", ") + ": in no batch, but anchored through the chain",
+    "record " + coveredBy.get(covered[covered.length - 1]).seq + ", which is anchored, names the record before it, and so on back: so its anchor commits to " +
+    (covered.length === 1 ? "this record" : "these records") + " too");
+  if (loose.length) step(null, "Record" + (loose.length === 1 ? " " : "s ") + loose.join(", ") + ": not anchored yet",
+    "no anchored record in this chain names " + (loose.length === 1 ? "it" : "them") + ", so Receipts has not committed to " +
+    (loose.length === 1 ? "it" : "them") + " yet; a figure counting " + (loose.length === 1 ? "it" : "them") + " rests on our word", { kind: "unanchored" });
+
+  /* ----- the newest checkpoint closes the chain's end ----- */
+  const now = opts.now ? new Date(opts.now).getTime() : Date.now();
+  let newest = null;
+  for (const seq of seqs) {
+    if (!leaves.has(seq) || kindOf(bySeq.get(seq).record) !== "checkpoint") continue;
+    const entry = bySeq.get(seq);
+    const group = entry.root ? roots.get(String(entry.root).toLowerCase()) : null;
+    const at = group && group.ok ? group.at : (coveredBy.get(seq) || {}).at;
+    if (typeof at === "number") newest = { seq: seq, at: at };
+  }
+  if (newest === null) {
+    step(null, "No anchored checkpoint closes this chain", "Receipts adds a checkpoint to every caller's chain once a day. " +
+      "Without an anchored one, records made after the newest record here could be missing and nothing would show it", { kind: "no-checkpoint" });
+  } else {
+    const age = now - newest.at;
+    if (age > CHECKPOINT_STALE_MS) step(null, "The newest checkpoint here is " + ageOf(age) + " old",
+      "record " + newest.seq + ", anchored at " + new Date(newest.at).toISOString() + ". Receipts adds one a day, so records made since may be " +
+      "missing from this export. Ask for the caller's newest", { kind: "stale" });
+    else step(true, "Closed by checkpoint " + newest.seq + ", anchored " + ageOf(Math.max(age, 0)) + " ago, by your clock",
+      "every number from 1 to " + newest.seq + " is accounted for here, so nothing up to it was held back");
+  }
+
+  /* ----- the claims: each post's time, read from its own link ----- */
+  const claims = seqs.filter(seq => leaves.has(seq) && kindOf(bySeq.get(seq).record) === "claim").map(seq => ({ seq: seq, record: bySeq.get(seq).record }));
+  const timed = [], mistimed = [];
+  for (const { seq, record } of claims) {
+    const post = xPostTime(String(record.sourceUrl || ""));
+    if (!post || post.at === null) continue;
+    if (sameSecond(String(record.postedAt || ""), post.at)) timed.push(seq);
+    else mistimed.push(seq + " says " + record.postedAt + ", its post id says " + post.at);
+  }
+  if (mistimed.length) step(false, "A record's post time is not its post's", "record " + mistimed.join("; record "));
+  else step(timed.length > 0 ? true : null, "Post times read from their X post ids: " + timed.length + " of " + claims.length + " claims",
+    timed.length === claims.length
+      ? "every claim's post time is the one its own link holds, so the time it was called does not rest on the record"
+      : "the rest carry no X post id in their link, so for those the time rests on the record");
+
+  /* ----- the baselines the score rests on, worked out again from each record's own closes ----- */
+  const settlements = seqs.filter(seq => leaves.has(seq) && kindOf(bySeq.get(seq).record) === "settlement").map(seq => ({ seq: seq, record: bySeq.get(seq).record }));
+  const claimByLeaf = new Map(claims.map(c => [leaves.get(c.seq), c.record]));
+  const reworked = [], untried = [], wrong = [];
+  let withBaseline = 0;
+  for (const { seq, record } of settlements) {
+    if (!record.baseline || typeof record.baseline !== "object") continue;
+    withBaseline++;
+    const claim = claimByLeaf.get(record.claimLeaf);
+    if (!claim) { untried.push(seq + ": its claim is not shown"); continue; }
+    const sources = (opts.ruleSources || RULE_SOURCES)[record.rule];
+    if (!RULES_KNOWN.includes(record.rule) || !sources) { untried.push(seq + ": this verifier does not know the rule " + JSON.stringify(record.rule)); continue; }
+    const call = { condition: claim.condition || {}, postedAt: claim.postedAt, deadline: claim.deadline };
+    const evidence = record.evidence || {};
+    const bad = baselineSeriesProblem(record.rule, sources.baseline, call.condition.coin, evidence.volatility || null, evidence.benchmark || null);
+    if (bad) { wrong.push(seq + ": " + bad); continue; }
+    const series = [[evidence.volatility, call.condition.coin], [evidence.benchmark, BENCHMARK_COIN]];
+    const named = series.map(([s, of]) => (s ? seriesProblem(s, of) : null)).find(Boolean);
+    if (named) { wrong.push(seq + ": " + named); continue; }
+    const volatility = evidence.volatility && Array.isArray(evidence.volatility.points) ? evidence.volatility.points : null;
+    const benchmark = evidence.benchmark && Array.isArray(evidence.benchmark.points) ? evidence.benchmark.points : null;
+    if (!volatility || (evidence.benchmark && !benchmark)) { untried.push(seq + ": its baseline's closes are in data files, not in the record"); continue; }
+    if (record.rule !== "crypto-price@1") { untried.push(seq + ": a " + record.rule + " baseline starts from the entry, which is in the data files"); continue; }
+    try {
+      checkDailyCloses(volatility);
+      if (benchmark) checkDailyCloses(benchmark);
+      const again = baselineFor(record.rule, call, { outcome: record.outcome, decidedAt: record.decidedAt, reason: record.reason }, volatility, benchmark);
+      if (again.model === record.baseline.model && near(again.p, record.baseline.p, 1e-6)) reworked.push(seq);
+      else wrong.push(seq + ": it says " + record.baseline.model + " p " + record.baseline.p + ", worked out again " + again.model + " p " + again.p);
+    } catch (e) { wrong.push(seq + ": its baseline cannot be worked out from its own closes, " + e.message); }
+  }
+  if (wrong.length) step(false, "A settlement's baseline does not follow from its own data", "record " + wrong.join("; record "));
+  else if (withBaseline === 0) step(null, "No baseline to work out again", "none of these settlements carries one yet, so no call counts towards a score");
+  else step(reworked.length > 0 ? true : null, "Baselines worked out again: " + reworked.length + " of " + withBaseline,
+    untried.length === 0
+      ? "each from the closes its own record holds, so every figure below rests on the records, not on us"
+      : "not worked out again: record " + untried.join("; record ") + ". Check each with its own settlement bundle",
+    reworked.length > 0 ? undefined : { kind: "baselines" });
+
+  /* ----- the score itself ----- */
+  let mine = null;
+  try { mine = scoreCaller(records, bundle.asOf); }
+  catch (e) { step(false, "The score cannot be worked out from these records", e.message); return steps; }
+  const difference = scoreDifference(mine, bundle.score);
+  if (difference) { step(false, "The score does not follow from these records", difference); return steps; }
+  const parts = mine.topics.map(t => t.topic + " " + (t.record.edge ? figureText(t.record.edge) + " over " + t.record.calls + " calls" : t.record.calls + " calls, too few weeks for a figure") + (t.provisional ? ", provisional" : ""));
+  step(true, "Score worked out again, figure for figure", mine.method + " over these records gives exactly what the export states" +
+    (parts.length ? ": " + parts.join("; ") : "") + ". The seed is the hash of the settlements read, so anyone with these records gets the same range");
+  return steps;
+}
+
+// An export verifies only when its chain is whole, every batched record is in
+// a batch Receipts anchored, and the score follows from the records. Records
+// Receipts is not showing, records not yet anchored and a stale checkpoint
+// each leave the score standing on less than the records alone, so each gets
+// a verdict of its own rather than passing quietly.
+function summariseExport(steps){
+  const soft = ["withheld", "unanchored", "stale", "no-checkpoint", "sender-unchecked", "baselines"];
+  if (steps.some(s => s.ok === false && !soft.includes(s.kind))) return { verdict: "failed", message: "This export did not verify." };
+  const has = kind => steps.some(s => s.kind === kind);
+  if (has("sender-unchecked")) return { verdict: "sender-unchecked", message: "Not verified: the records match what was anchored, but an anchor's sender is not a published Receipts key, so this does not show that Receipts anchored them." };
+  if (has("withheld")) return { verdict: "records-withheld", message: "The score follows from the records given, but Receipts is holding back a record in this chain, so calls may be missing from it." };
+  if (has("unanchored")) return { verdict: "not-all-anchored", message: "The score follows from the records given, but some of them are not anchored yet, so those rest on our word." };
+  if (has("no-checkpoint")) return { verdict: "unclosed", message: "The score follows from the records given, but no anchored checkpoint closes the chain, so newer records could be missing." };
+  if (has("stale")) return { verdict: "stale", message: "The score follows from the records given, but the newest checkpoint here is more than two days old, so records made since may be missing." };
+  if (has("baselines")) return { verdict: "baselines-unchecked", message: "The records are anchored and the score follows from them, but no baseline was worked out again, so the figures rest on baselines this export does not show the workings for." };
+  return { verdict: "verified", message: "This export verifies: the chain is whole, the records are the ones Receipts anchored, and the score follows from them." };
+}
+
+globalThis.ReceiptsVerifier = { keccak256, canonicalJson, recordLeaf, normalisePostText, postTextHash, xPostTime, sameSecond, imageUrl, matchImage, rootFromProof, decodeAnchorPayload, verifyBundle, summarise,
+  readArchivedPost, postTextFromHtml, checkArchivedCopy, rawArchiveUrl,
+  sha256, zipEntry, readBinanceFile, cryptoPrice1, cryptoTrade1, settleCall, phi, firstPassage, stopTarget, baselineFor,
+  RULE_SOURCES, sourcesProblem, baselineSeriesProblem, seriesProblem, leftOutProblem, verifySettlement, summariseSettlement,
+  xoshiro128ss, below, weekOf, percent, scoreCaller, verifyCheckpoint, summariseCheckpoint,
+  scoreDifference, verifyExport, summariseExport };
+</script>
+
+<script>
+"use strict";
+(function () {
+  const { verifyBundle, summarise, verifySettlement, summariseSettlement, verifyCheckpoint, summariseCheckpoint,
+    verifyExport, summariseExport } = globalThis.ReceiptsVerifier;
+  const $ = id => document.getElementById(id);
+  // Everything from the bundle is rendered as text, never as HTML: a bundle
+  // is untrusted input.
+  const SECTIONS = { claim: "The claim", settlement: "The settlement" };
+  function show(steps, summary) {
+    const list = $("steps");
+    list.replaceChildren();
+    let section = null;
+    for (const s of steps) {
+      if (s.section && s.section !== section) {
+        section = s.section;
+        const heading = document.createElement("li");
+        heading.className = "section";
+        heading.textContent = SECTIONS[section] || section;
+        list.append(heading);
+      }
+      const li = document.createElement("li");
+      li.className = s.ok === true ? "ok" : s.ok === false ? "bad" : "warn";
+      const mark = document.createElement("span");
+      mark.className = "mark";
+      mark.textContent = s.ok === true ? "✓" : s.ok === false ? "✗" : "!";
+      const title = document.createElement("span");
+      title.textContent = s.title;
+      const detail = document.createElement("span");
+      detail.className = "detail";
+      detail.textContent = s.detail || "";
+      li.append(mark, title, detail);
+      list.append(li);
+    }
+    $("summary").textContent = (summary || summarise)(steps).message;
+  }
+  async function filesOf(input) {
+    const files = [];
+    for (const file of $(input).files) files.push({ name: file.name, bytes: new Uint8Array(await file.arrayBuffer()) });
+    return files;
+  }
+  $("verify").addEventListener("click", async () => {
+    $("summary").textContent = "Checking…";
+    let bundle;
+    try { bundle = JSON.parse($("bundle").value); }
+    catch (e) { show([{ ok: false, title: "That is not valid JSON", detail: e.message }]); return; }
+    const opts = { postText: $("post-text").value, imageFiles: await filesOf("photos"), archiveFiles: await filesOf("archive-copies"), dataFiles: await filesOf("data-files") };
+    if (bundle && bundle.export === "caller") show(await verifyExport(bundle, opts), summariseExport);
+    else if (bundle && bundle.settlement) show(await verifySettlement(bundle, opts), summariseSettlement);
+    else if (bundle && bundle.checkpoint) show(await verifyCheckpoint(bundle, opts), summariseCheckpoint);
+    else show(await verifyBundle(bundle, opts));
+  });
+})();
+</script>
+</body>
+</html>
