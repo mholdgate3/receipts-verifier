@@ -862,6 +862,9 @@ async function checkAnchors(steps, anchors, root, cid, opts, idOf, afterAnchor){
       check("cid", payload.cid === cid, "Anchored batch file matches", "CID " + payload.cid);
       const block = await rpc(url, "eth_getBlockByNumber", [tx.blockNumber, false], fetchImpl);
       const when = new Date(parseInt(block.timestamp, 16) * 1000);
+      // A score counts only what was anchored by its time, so the time stated has to be the block's.
+      if (anchor.anchoredAt !== undefined && Date.parse(anchor.anchoredAt) !== when.getTime()) step(false, "The anchor's stated time is not its block's",
+        label + " says " + anchor.anchoredAt + ", but block " + parseInt(tx.blockNumber, 16) + " is at " + when.toISOString());
       if (!attestors.some(k => k.chainId === anchor.chainId)) check("sender", null, "Anchor sender not checked against a published key",
         "sent by " + tx.from + "; " + (attestors.length === 0
           ? "no Receipts key is published in this verifier yet, so anyone could have sent it"
@@ -1624,11 +1627,12 @@ function summariseSettlement(steps){
 /* ---------- scores: the same method as the server's src/scoring/score.ts ---------- */
 // A caller's edge is the average of what happened less what the baseline
 // said, over the calls that count, with a 95% range from a bootstrap over the
-// weeks they count in. The seed is the hash of the settlements read, the
-// generator and its draws are fixed, and every sum is whole millionths, so
-// anyone with the same records gets the same figures.
+// weeks they count in, widened for having few of them. Only settlements an
+// anchor had committed to by the score's time count. The seed is the hash of
+// the settlements read, the generator and its draws are fixed, and every sum
+// is whole millionths, so anyone with the same records gets the same figures.
 
-const SCORE_METHOD = "cluster-bootstrap@1", RESAMPLES = 10000, LOW_RANK = 250, HIGH_RANK = RESAMPLES - LOW_RANK - 1;
+const SCORE_METHOD = "cluster-bootstrap@2", RESAMPLES = 10000, LOW_RANK = 250, HIGH_RANK = RESAMPLES - LOW_RANK - 1;
 const MIN_CLUSTERS = 5, PROVISIONAL_BELOW = 20, FORM_CALLS = 30, MILLION = 1000000;
 const TOPIC_FOR_KIND = { "crypto-price": "crypto", "crypto-trade": "crypto" };
 const hashCanonical = value => keccak256(utf8(canonicalJson(value)));
@@ -1652,11 +1656,33 @@ function weekOf(ms){
   const day = Math.floor(ms / DAY_MS);
   return new Date((day - (((day + 3) % 7) + 7) % 7) * DAY_MS).toISOString().slice(0, 10);
 }
-function percent(sum, count, signed){
-  const num = BigInt(sum), den = BigInt(count) * 1000n;
-  const tenths = ((num < 0n ? -num : num) * 2n + den) / (2n * den);
+function ratioPercent(num, den, signed){
+  const scaled = den * 1000n;
+  const tenths = ((num < 0n ? -num : num) * 2n + scaled) / (2n * scaled);
   const text = (tenths / 10n) + "." + (tenths % 10n);
   return !signed || tenths === 0n ? text : (num < 0n ? "-" : "+") + text;
+}
+const percent = (sum, count, signed) => ratioPercent(BigInt(sum), BigInt(count), signed);
+function isqrt(n){
+  if (n < 2n) return n;
+  let x = n, y = (x + 1n) / 2n;
+  while (y < x) { x = y; y = (x + n / x) / 2n; }
+  return x;
+}
+// How much a range is widened for resting on k clusters, in millionths:
+// √(k/(k−1)) × t/z, t being Student's t's 97.5% point on k − 1 degrees of
+// freedom from its expansion in z (Abramowitz and Stegun 26.7.5, four terms).
+// Whole numbers throughout, rounded to six decimals, so no browser's
+// logarithm or exponential can change a digit.
+const Z_975 = 1959964n, MILLIONTHS = 1000000n;
+function rangeFactor(k){
+  const n = BigInt(k - 1), D = MILLIONTHS;
+  const zp = p => Z_975 ** BigInt(p) * D ** BigInt(9 - p);
+  const t = 92160n * n ** 4n * zp(1) + 23040n * n ** 3n * (zp(3) + zp(1)) + 960n * n ** 2n * (5n * zp(5) + 16n * zp(3) + 3n * zp(1)) +
+    240n * n * (3n * zp(7) + 19n * zp(5) + 17n * zp(3) - 15n * zp(1)) + (79n * zp(9) + 776n * zp(7) + 1482n * zp(5) - 1920n * zp(3) - 945n * zp(1));
+  const under = 92160n * n ** 4n * D ** 8n * Z_975;
+  const four = (4n * D * D * BigInt(k) * t * t) / (n * under * under);
+  return (isqrt(four) + 1n) / 2n;
 }
 function millionths(p){
   if (typeof p !== "string" || !/^(?:0\.\d{6}|1\.000000)$/.test(p)) throw new Error("a baseline probability has six decimals from 0 to 1, not " + JSON.stringify(p));
@@ -1691,10 +1717,17 @@ function estimate(calls){
     counts.push(count); hitSums.push(hit); pSums.push(p);
   }
   const totalHit = hits * MILLION, totalP = calls.reduce((sum, call) => sum + call.p, 0);
+  const factor = rangeFactor(k), D = MILLIONTHS;
   const figure = (sums, value, signed) => {
     const order = Array.from({ length: RESAMPLES }, (_, i) => i).sort(byValue(sums, counts));
-    const low = order[LOW_RANK], high = order[HIGH_RANK];
-    return { value: percent(value, calls.length, signed), low: percent(sums[low], counts[low], signed), high: percent(sums[high], counts[high], signed) };
+    // The figure plus the resample's distance from it times the factor, kept within what is possible.
+    const bound = r => {
+      const N = BigInt(calls.length), n = BigInt(counts[r]), s = BigInt(sums[r]), v = BigInt(value);
+      const den = N * n * D, floor = (signed ? -D : 0n) * den, ceiling = D * den;
+      const num = v * n * D + (s * N - v * n) * factor;
+      return ratioPercent(num < floor ? floor : num > ceiling ? ceiling : num, den, signed);
+    };
+    return { value: percent(value, calls.length, signed), low: bound(order[LOW_RANK]), high: bound(order[HIGH_RANK]) };
   };
   return Object.assign(base, {
     edge: figure(hitSums.map((hit, r) => hit - pSums[r]), totalHit - totalP, true),
@@ -1702,8 +1735,12 @@ function estimate(calls){
     baseline: figure(pSums, totalP, false),
   });
 }
-function scoreCaller(records, asOf){
+// anchoredAt gives, by place, when each record's own batch was first anchored.
+// A settlement counts only once an anchor had committed to it by asOf: its
+// own, or a later record's with every record between given.
+function scoreCaller(records, asOf, anchoredAt){
   if (!Array.isArray(records) || records.length === 0) throw new Error("a score needs the caller's records");
+  if (!anchoredAt || typeof anchoredAt !== "object") throw new Error("a score needs the times the records were anchored");
   const asOfDate = new Date(asOf);
   if (Number.isNaN(asOfDate.getTime())) throw new Error("not a valid timestamp: " + String(asOf));
   const at = asOfDate.toISOString(), now = Date.parse(at);
@@ -1717,6 +1754,18 @@ function scoreCaller(records, asOf){
   const seqs = [...bySeq.keys()].sort((a, b) => a - b);
   const highest = seqs[seqs.length - 1], gaps = [];
   for (let seq = 1; seq <= highest; seq++) if (!bySeq.has(seq)) gaps.push(seq);
+  const committed = new Set();
+  let covered = false;
+  for (let seq = highest; seq >= 1; seq--) {
+    if (!bySeq.has(seq)) { covered = false; continue; }
+    const when = Object.prototype.hasOwnProperty.call(anchoredAt, seq) ? anchoredAt[seq] : undefined;
+    if (when !== undefined) {
+      const time = Date.parse(when);
+      if (Number.isNaN(time)) throw new Error("record " + seq + "'s anchor time is not a time: " + JSON.stringify(when));
+      if (time <= now) covered = true;
+    }
+    if (covered) committed.add(seq);
+  }
   let callerId = null, checkpoint = null;
   const leaves = new Map(), claims = new Map(), calls = [];
   for (const seq of seqs) {
@@ -1734,14 +1783,15 @@ function scoreCaller(records, asOf){
       const topic = TOPIC_FOR_KIND[String(record.condition.kind)] ?? null;
       const line = { callerSeq: seq, claimId: record.claimId, topic, status: "open", settlement: null, outcome: null, scoresFrom: null, week: null, edge: null };
       calls.push(line);
-      claims.set(record.claimId, { claim: record, line, latest: null, latestSeq: seq, latestLeaf: null });
+      claims.set(record.claimId, { claim: record, line, latest: null, anchored: null });
     } else if (kind === "settlement") {
       const entry = claims.get(record.claimId);
       if (!entry || record.claimLeaf !== recordLeaf(entry.claim)) throw new Error("record " + seq + " settles a claim that is not before it in the records");
       if (!entry.line.topic) throw new Error("record " + seq + " is a settlement, but no rule settles a " + String(entry.claim.condition.kind) + " call");
-      if (((record.replaces && record.replaces.leaf) ?? null) !== entry.latestLeaf) throw new Error("record " + seq + " does not replace its claim's previous settlement in the chain");
+      if (((record.replaces && record.replaces.leaf) ?? null) !== (entry.latest ? entry.latest.leaf : null)) throw new Error("record " + seq + " does not replace its claim's previous settlement in the chain");
       if (!(Date.parse(record.settledAt) <= now)) throw new Error("record " + seq + ", a settlement, is from after " + at);
-      Object.assign(entry, { latest: record, latestSeq: seq, latestLeaf: leaf });
+      entry.latest = { settlement: record, seq, leaf };
+      if (committed.has(seq)) entry.anchored = entry.latest;
     } else if (kind === "checkpoint") {
       const made = String(record.at);
       if (!(Date.parse(made) <= now)) throw new Error("record " + seq + ", a checkpoint, is from after " + at);
@@ -1750,14 +1800,16 @@ function scoreCaller(records, asOf){
   }
   if (callerId === null) throw new Error("a score needs at least one of the caller's claims");
   const counted = new Map();
-  for (const { claim, line, latest: settlement, latestSeq: seq, latestLeaf } of claims.values()) {
+  for (const { claim, line, latest, anchored } of claims.values()) {
     const topic = line.topic;
     if (topic && !counted.has(topic)) counted.set(topic, []);
-    if (!settlement) {
+    if (latest && !anchored) { Object.assign(line, { status: "unanchored", settlement: latest.leaf, outcome: latest.settlement.outcome }); continue; }
+    if (!anchored) {
       if (!topic) line.status = "no-rule";
       else if (now >= Date.parse(claim.deadline)) line.status = "unsettled";
       continue;
     }
+    const { settlement, seq, leaf: latestLeaf } = anchored;
     line.settlement = latestLeaf;
     line.outcome = settlement.outcome;
     if (settlement.outcome === "void") { line.status = "void"; continue; }
@@ -2048,7 +2100,7 @@ async function verifyExport(bundle, opts = {}){
     (covered.length === 1 ? "this record" : "these records") + " too");
   if (loose.length) step(null, "Record" + (loose.length === 1 ? " " : "s ") + loose.join(", ") + ": not anchored yet",
     "no anchored record in this chain names " + (loose.length === 1 ? "it" : "them") + ", so Receipts has not committed to " +
-    (loose.length === 1 ? "it" : "them") + " yet; a figure counting " + (loose.length === 1 ? "it" : "them") + " rests on our word", { kind: "unanchored" });
+    (loose.length === 1 ? "it" : "them") + " yet. The score leaves out any settlement no anchor had committed to by its time", { kind: "unanchored" });
 
   /* ----- the newest checkpoint closes the chain's end ----- */
   const now = opts.now ? new Date(opts.now).getTime() : Date.now();
@@ -2127,8 +2179,17 @@ async function verifyExport(bundle, opts = {}){
     reworked.length > 0 ? undefined : { kind: "baselines" });
 
   /* ----- the score itself ----- */
+  // When each shown record's batch was first anchored, as the export states it
+  // and as each anchor read from the chain above was checked against its block.
+  const anchoredAt = {};
+  for (const seq of seqs) {
+    const anchors = leaves.has(seq) && Array.isArray(bySeq.get(seq).anchors) ? bySeq.get(seq).anchors : [];
+    for (const anchor of anchors) {
+      if (!(seq in anchoredAt) || Date.parse(anchor.anchoredAt) < Date.parse(anchoredAt[seq])) anchoredAt[seq] = anchor.anchoredAt;
+    }
+  }
   let mine = null;
-  try { mine = scoreCaller(records, bundle.asOf); }
+  try { mine = scoreCaller(records, bundle.asOf, anchoredAt); }
   catch (e) { step(false, "The score cannot be worked out from these records", e.message); return steps; }
   const difference = scoreDifference(mine, bundle.score);
   if (difference) { step(false, "The score does not follow from these records", difference); return steps; }
@@ -2149,7 +2210,7 @@ function summariseExport(steps){
   const has = kind => steps.some(s => s.kind === kind);
   if (has("sender-unchecked")) return { verdict: "sender-unchecked", message: "Not verified: the records match what was anchored, but an anchor's sender is not a published Receipts key, so this does not show that Receipts anchored them." };
   if (has("withheld")) return { verdict: "records-withheld", message: "The score follows from the records given, but Receipts is holding back a record in this chain, so calls may be missing from it." };
-  if (has("unanchored")) return { verdict: "not-all-anchored", message: "The score follows from the records given, but some of them are not anchored yet, so those rest on our word." };
+  if (has("unanchored")) return { verdict: "not-all-anchored", message: "The score follows from the records given and leaves out settlements not yet anchored, but some records here are not anchored yet, so those rest on our word until they are." };
   if (has("no-checkpoint")) return { verdict: "unclosed", message: "The score follows from the records given, but no anchored checkpoint closes the chain, so newer records could be missing." };
   if (has("stale")) return { verdict: "stale", message: "The score follows from the records given, but the newest checkpoint here is more than two days old, so records made since may be missing." };
   if (has("baselines")) return { verdict: "baselines-unchecked", message: "The records are anchored and the score follows from them, but no baseline was worked out again, so the figures rest on baselines this export does not show the workings for." };
@@ -2160,7 +2221,7 @@ globalThis.ReceiptsVerifier = { keccak256, canonicalJson, recordLeaf, normaliseP
   readArchivedPost, postTextFromHtml, checkArchivedCopy, rawArchiveUrl,
   sha256, zipEntry, readBinanceFile, cryptoPrice1, cryptoTrade1, settleCall, phi, firstPassage, stopTarget, baselineFor,
   RULE_SOURCES, sourcesProblem, baselineSeriesProblem, seriesProblem, leftOutProblem, verifySettlement, summariseSettlement,
-  xoshiro128ss, below, weekOf, percent, scoreCaller, verifyCheckpoint, summariseCheckpoint,
+  xoshiro128ss, below, weekOf, percent, rangeFactor, scoreCaller, verifyCheckpoint, summariseCheckpoint,
   scoreDifference, verifyExport, summariseExport };
 </script>
 

@@ -10,5 +10,17 @@
       "index.html": "6f51c7934cdf2a2c686f71235576f96450416910670c0007def318acd8e2119a",
       "serve.mjs": "ea4863f26e701ad649b8c714b321ad3bb5c6f950c9a8806942cd51f9082aa602"
     }
+  },
+  {
+    "release": 2,
+    "at": "2026-10-28T22:24:41.125Z",
+    "sha256": {
+      "LICENSE": "0dbbe089e467a0d899c67c263df30728e128d38e22ba49fb45ef5e0df41cf1c0",
+      "README.md": "125ff938b8ff99c8c2feb2d5492282e2f8173ebeacc45fba9741c3b487383e4b",
+      "attestors.json": "79b3262384dec0af64b4e03858aaee0f72b223fe80c12cdadd37df1dddfbbe28",
+      "check.mjs": "d5c213e11a2c21ddb1d22ca8b698c625d70d216bb61dc6477e9ff856bbf93859",
+      "index.html": "0d9fae3290169715ff302c298b3ac1943dc59a77eb2365e7c92912e7752073ac",
+      "serve.mjs": "ea4863f26e701ad649b8c714b321ad3bb5c6f950c9a8806942cd51f9082aa602"
+    }
   }
 ]
